@@ -78,7 +78,7 @@ struct TypeVar {
 #[derive(Debug, PartialEq, Clone)]
 struct TypeCon {
     name: String,
-    args: Vec<TypeVar>,
+    args: Vec<MonoTypePtr>,
 }
 
 impl Into<MonoType> for TypeVar {
@@ -128,6 +128,14 @@ impl MonoType {
         .into()
     }
 
+    fn con_with_args(name: &str, args: Vec<MonoTypePtr>) -> MonoTypePtr {
+        MonoType::Con(TypeCon {
+            name: name.into(),
+            args,
+        })
+        .into()
+    }
+
     fn name(&self) -> String {
         match self {
             MonoType::Con(c) => c.name.clone(),
@@ -152,7 +160,7 @@ enum Kind {
     Var,
     Num,
     Assignation,
-    Function,
+    Function(u32),
 }
 
 #[derive(Debug, Clone)]
@@ -246,17 +254,27 @@ fn inferno<'a>(ast: &'a Node<'a>, env: TypeEnv) -> TypeEnv {
         match ast.kind {
             Kind::Num => ast.set_type_equals(MonoType::con("u32"), &mut env),
             Kind::Assignation => {
-                if let Some([left, right]) = &ast.children.as_array() {
-                    env = inferno_rec(left, env);
-                    env = inferno_rec(right, env);
-                    unify(left, right, &mut env);
-                } else {
-                    panic!("Wrong")
-                }
+                let [left, right] = &ast.children.as_array().unwrap();
+                env = inferno_rec(left, env);
+                env = inferno_rec(right, env);
+                unify(left, right, &mut env);
                 ast.set_type_equals(MonoType::con("()"), &mut env);
             }
             Kind::Var => {}
-            Kind::Function => todo!(),
+            Kind::Function(_) => {
+                let mut function_env = env.clone();
+                // fresh variable for the function argument
+                let arg = &ast.children[0];
+                let arg_type = arg.get_type(&mut function_env);
+                inferno_rec(&ast.children[1], function_env);
+                ast.set_type_equals(
+                    MonoType::con_with_args(
+                        "->",
+                        vec![arg_type, ast.children[1].get_type(&mut env)],
+                    ),
+                    &mut env,
+                );
+            }
         }
         env
     }
@@ -287,6 +305,41 @@ mod tests {
             MonoType::Var(TypeVar {
                 name: "a".into(),
                 eq: None
+            })
+        );
+    }
+
+    #[test]
+    fn identity() {
+        let id = Node {
+            lexem: "id",
+            children: vec![
+                Node {
+                    lexem: "a",
+                    children: vec![],
+                    monotype: Default::default(),
+                    kind: Kind::Var,
+                },
+                Node {
+                    lexem: "a",
+                    children: vec![],
+                    monotype: Default::default(),
+                    kind: Kind::Var,
+                },
+            ],
+            monotype: Default::default(),
+            kind: Kind::Function(1),
+        };
+
+        let mut env = inferno(&id, TypeEnv::default());
+        // check if types have been created
+        assert!(id.children[0].monotype.borrow().is_some());
+        assert!(id.children[1].monotype.borrow().is_some());
+        assert_eq!(
+            *id.find(&mut env).borrow(),
+            MonoType::Con(TypeCon {
+                name: "->".into(),
+                args: vec![MonoType::var("a"), MonoType::var("a")]
             })
         );
     }
