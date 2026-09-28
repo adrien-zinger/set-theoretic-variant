@@ -116,7 +116,7 @@ fn instanciate(ty: &TypePtr) -> Type {
 fn generalize(ty: &TypePtr) -> Type {
     let ty_inner = ty.borrow();
     match &*ty_inner {
-        Type::Var(var) => Type::Scheme(Scheme {
+        Type::Var(_) => Type::Scheme(Scheme {
             for_all: vec![ty.clone()],
             ty: ty.clone(),
         }),
@@ -142,42 +142,6 @@ struct Scheme {
 }
 
 impl Type {
-    fn find_recursive(&self, env: &mut TypeEnv) -> Type {
-        let mut ty = self.clone();
-        if let Type::Var(_) = &ty {
-            return self.find(env);
-        }
-
-        if let Type::Con(con) = &ty {
-            let args = con
-                .args
-                .iter()
-                .map(|arg_ty| (*arg_ty.borrow()).find(env).into())
-                .collect();
-            return Type::Con(TypeCon {
-                name: con.name.clone(),
-                args,
-            });
-        }
-
-        panic!("unexpected scheme type during find_recursive call");
-    }
-
-    fn find(&self, env: &mut TypeEnv) -> Type {
-        let mut ty = self.clone();
-        while let Type::Var(type_var) = ty.clone() {
-            println!("ploup");
-            if let Some(type_eq) = &type_var.eq {
-                println!("try get {type_eq}");
-                ty = env.get(type_eq).unwrap().borrow().clone();
-            } else {
-                break;
-            }
-        }
-        println!("end");
-        ty
-    }
-
     fn var(name: &str) -> TypePtr {
         Type::Var(TypeVar {
             name: name.into(),
@@ -231,7 +195,7 @@ enum Kind {
     Var,
     Num,
     Assignation,
-    Function(u32),
+    Function,
 }
 
 #[derive(Debug, Clone)]
@@ -333,7 +297,7 @@ fn inferno<'a>(ast: &'a Node<'a>, env: TypeEnv) -> TypeEnv {
                 ast.set_type_equals(Type::con("()"), &mut env);
             }
             Kind::Var => {}
-            Kind::Function(_) => {
+            Kind::Function => {
                 let mut function_env = env.clone();
                 // fresh variable for the function argument
                 let arg = &ast.children[0];
@@ -397,7 +361,7 @@ mod tests {
                 },
             ],
             r#type: Default::default(),
-            kind: Kind::Function(1),
+            kind: Kind::Function,
         };
 
         println!("start inference");
