@@ -105,10 +105,48 @@ impl Into<MonoType> for TypeCon {
     }
 }
 
+fn instanciate_inplace(ty: &MonoTypePtr) {
+    let new_type = {
+        let ty = ty.borrow();
+        match &*ty {
+            MonoType::Scheme(sche) => sche.ty.borrow().clone(),
+            _ => return,
+        }
+    };
+
+    *ty.borrow_mut() = new_type;
+}
+
+fn generalize_inplace(ty: &MonoTypePtr) {
+    let mut ty_mut = ty.borrow_mut();
+    match &*ty_mut {
+        MonoType::Var(var) => {
+            *ty_mut = MonoType::Scheme(Scheme {
+                for_all: vec![ty.clone()],
+                ty: ty.clone(),
+            })
+        }
+        MonoType::Con(con) => {
+            *ty_mut = MonoType::Scheme(Scheme {
+                for_all: con.args.clone(),
+                ty: ty.clone(),
+            })
+        }
+        _ => {}
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum MonoType {
     Var(TypeVar), // TyVar("a"), because a is associated to the variable but unconstrained :)
     Con(TypeCon), // TyCon("list", [TyVar("a")]) | TyCon("list", [TyCon("int", [])]) | TyCon("int", [])
+    Scheme(Scheme),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Scheme {
+    for_all: Vec<MonoTypePtr>,
+    ty: MonoTypePtr,
 }
 
 impl MonoType {
@@ -136,10 +174,15 @@ impl MonoType {
         .into()
     }
 
+    fn scheme(for_all: Vec<MonoTypePtr>, ty: MonoTypePtr) -> MonoTypePtr {
+        MonoType::Scheme(Scheme { for_all, ty }).into()
+    }
+
     fn name(&self) -> String {
         match self {
             MonoType::Con(c) => c.name.clone(),
-            MonoType::Var(c) => c.name.clone(),
+            MonoType::Var(v) => v.name.clone(),
+            MonoType::Scheme(s) => s.ty.borrow().name(),
         }
     }
 
@@ -244,6 +287,7 @@ fn unify<'a>(left: &'a Node, right: &'a Node, env: &mut TypeEnv) {
             }
             */
         }
+        _ => todo!(),
     };
 
     unify(right, left, env)
@@ -370,6 +414,36 @@ mod tests {
         // check if types have been created
         assert!(a_is_b.children[0].monotype.borrow().is_some());
         assert!(a_is_b.children[1].monotype.borrow().is_some());
+    }
+
+    fn generalize() {
+        let ty_a = MonoType::var("a");
+        generalize_inplace(&ty_a);
+        assert_eq!(
+            *ty_a.borrow(),
+            MonoType::Scheme(Scheme {
+                for_all: vec![MonoType::var("a")],
+                ty: MonoType::var("a")
+            })
+        );
+
+        let ty_b = MonoType::con_with_args("b", vec![MonoType::var("a")]);
+        generalize_inplace(&ty_b);
+        assert_eq!(
+            *ty_a.borrow(),
+            MonoType::Scheme(Scheme {
+                for_all: vec![MonoType::var("a")],
+                ty: MonoType::con_with_args("b", vec![MonoType::var("a")])
+            })
+        );
+    }
+
+    fn instanciate() {
+        let var_a = MonoType::var("a");
+        let ty_a = MonoType::scheme(vec![var_a.clone()], var_a);
+        instanciate_inplace(&ty_a);
+
+        assert_eq!(ty_a, MonoType::var("a"));
     }
 
     #[test]
