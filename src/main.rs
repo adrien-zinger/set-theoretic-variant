@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::rc::Rc;
 
@@ -51,7 +52,7 @@ fn main() {
     };
 
     println!("first call");
-    let mut env = inferno(&a_is_b, TypeEnv::default());
+    let mut env = inferno(&a_is_b, Env::default());
 
     println!("second call");
     env = inferno(&b_is_num, env);
@@ -59,7 +60,7 @@ fn main() {
 
     // check if type has been created
     assert_eq!(
-        *a_is_b.children[0].find(&mut env).borrow(),
+        *a_is_b.children[0].find(&mut env.type_env).borrow(),
         Type::Con(TypeCon {
             name: "u32".into(),
             args: vec![]
@@ -188,7 +189,13 @@ impl Type {
 
 type Id = String;
 type TypePtr = Rc<RefCell<Type>>;
-type TypeEnv = std::collections::HashMap<Id, TypePtr>;
+type TypeEnv = HashMap<Id, TypePtr>;
+
+#[derive(Default, Clone)]
+struct Env<'a> {
+    type_env: TypeEnv,
+    functions: HashMap<Id, Node<'a>>,
+}
 
 #[derive(Debug, Clone)]
 enum Kind {
@@ -196,6 +203,8 @@ enum Kind {
     Num,
     Assignation,
     Function,
+    If,
+    Apply,
 }
 
 #[derive(Debug, Clone)]
@@ -273,11 +282,9 @@ fn unify<'a>(left: &'a Node, right: &'a Node, env: &mut TypeEnv) {
             }
             return;
 
-            /* todo
             for (a, b) in ty_left.args.iter().zip(ty_right.args.iter().cloned()) {
-                (_, env) = unify(&a.into(), &b.into(), env);
+                (_, env) = unify(a, b, env);
             }
-            */
         }
         _ => todo!(),
     };
@@ -285,28 +292,50 @@ fn unify<'a>(left: &'a Node, right: &'a Node, env: &mut TypeEnv) {
     unify(right, left, env)
 }
 
-fn inferno<'a>(ast: &'a Node<'a>, env: TypeEnv) -> TypeEnv {
-    fn inferno_rec<'a>(ast: &'a Node<'a>, mut env: TypeEnv) -> TypeEnv {
+fn inferno<'a>(ast: &'a Node<'a>, env: Env<'a>) -> Env<'a> {
+    fn inferno_rec<'a>(ast: &'a Node<'a>, mut env: Env<'a>) -> Env<'a> {
         match ast.kind {
-            Kind::Num => ast.set_type_equals(Type::con("u32"), &mut env),
+            Kind::Num => ast.set_type_equals(Type::con("u32"), &mut env.type_env),
             Kind::Assignation => {
                 let [left, right] = &ast.children.as_array().unwrap();
                 env = inferno_rec(left, env);
                 env = inferno_rec(right, env);
-                unify(left, right, &mut env);
-                ast.set_type_equals(Type::con("()"), &mut env);
+                unify(left, right, &mut env.type_env);
+                ast.set_type_equals(Type::con("()"), &mut env.type_env);
             }
             Kind::Var => {}
             Kind::Function => {
+                env.functions.insert(ast.lexem.to_string(), ast.clone());
                 let mut function_env = env.clone();
                 // fresh variable for the function argument
                 let arg = &ast.children[0];
-                let arg_type = arg.get_type(&mut function_env);
+                let arg_type = arg.get_type(&mut function_env.type_env);
                 inferno_rec(&ast.children[1], function_env);
-                let ty =
-                    Type::con_with_args("->", vec![arg_type, ast.children[1].get_type(&mut env)])
-                        .into();
-                ast.set_type_equals(ty, &mut env);
+                let ty = Type::con_with_args(
+                    "->",
+                    vec![arg_type, ast.children[1].get_type(&mut env.type_env)],
+                )
+                .into();
+                ast.set_type_equals(ty, &mut env.type_env);
+            }
+            Kind::If => todo!(),
+            Kind::Apply => {
+                // retreive called function
+                let body = env.functions.get(ast.children[0].lexem).unwrap().clone();
+                // infer argument and get its type
+                env = inferno_rec(&ast.children[1], env);
+                let arg_type = ast.children[1].find(&mut env.type_env);
+
+                let mut function_env = env.clone();
+                function_env
+                    .type_env
+                    .insert(body.children[0].lexem.to_string(), arg_type);
+                function_env = inferno_rec(&body, function_env);
+
+                ast.set_type_equals(
+                    body.children[1].get_type(&mut function_env.type_env),
+                    &mut env.type_env,
+                );
             }
         }
         env
@@ -330,17 +359,109 @@ mod tests {
             kind: Kind::Var,
         };
 
-        let mut env = inferno(&input, TypeEnv::default());
+        let mut env = inferno(&input, Env::default());
 
         // check if type has been created
         assert_eq!(
-            *input.get_type(&mut env).borrow(),
+            *input.get_type(&mut env.type_env).borrow(),
             Type::Var(TypeVar {
                 name: "a".into(),
                 eq: None
             })
         );
     }
+
+    #[test]
+    fn apply() {
+        let id = Node {
+            lexem: "id",
+            children: vec![
+                Node {
+                    lexem: "a",
+                    children: vec![],
+                    r#type: Default::default(),
+                    kind: Kind::Var,
+                },
+                Node {
+                    lexem: "a",
+                    children: vec![],
+                    r#type: Default::default(),
+                    kind: Kind::Var,
+                },
+            ],
+            r#type: Default::default(),
+            kind: Kind::Function,
+        };
+        let env = inferno(&id, Env::default());
+
+        let apply_id = Node {
+            lexem: "id()",
+            children: vec![
+                Node {
+                    lexem: "id",
+                    children: vec![],
+                    r#type: Default::default(),
+                    kind: Kind::Var,
+                },
+                Node {
+                    lexem: "42",
+                    children: vec![],
+                    r#type: Default::default(),
+                    kind: Kind::Num,
+                },
+            ],
+            r#type: Default::default(),
+            kind: Kind::Apply,
+        };
+
+        let mut env = inferno(&apply_id, env);
+        assert_eq!(
+            *apply_id.get_type(&mut env.type_env).borrow(),
+            Type::Var(TypeVar {
+                name: "id()".into(),
+                eq: Some("u32".to_string())
+            })
+        );
+    }
+
+    /*
+    #[test]
+    fn if_case() {
+        let id = Node {
+            lexem: "if",
+            children: vec![
+                Node {
+                    lexem: "a",
+                    children: vec![],
+                    r#type: Default::default(),
+                    kind: Kind::Var,
+                },
+                Node {
+                    lexem: "a",
+                    children: vec![],
+                    r#type: Default::default(),
+                    kind: Kind::Var,
+                },
+            ],
+            r#type: Default::default(),
+            kind: Kind::If,
+        };
+
+        let mut env = inferno(&id, TypeEnv::default());
+        // check if types have been created
+        assert!(id.children[0].r#type.borrow().is_some());
+        assert!(id.children[1].r#type.borrow().is_some());
+        let ty = id.find(&mut env);
+        let ty = generalize(&ty);
+        assert_eq!(
+            ty,
+            Type::Scheme(Scheme {
+                for_all: vec![Type::var("a"), Type::var("a")],
+                ty: Type::con_with_args("->", vec![Type::var("a"), Type::var("a")]),
+            })
+        );
+    }
+    */
 
     #[test]
     fn identity() {
@@ -365,11 +486,11 @@ mod tests {
         };
 
         println!("start inference");
-        let mut env = inferno(&id, TypeEnv::default());
+        let mut env = inferno(&id, Env::default());
         // check if types have been created
         assert!(id.children[0].r#type.borrow().is_some());
         assert!(id.children[1].r#type.borrow().is_some());
-        let ty = id.find(&mut env);
+        let ty = id.find(&mut env.type_env);
         let ty = generalize(&ty);
         assert_eq!(
             ty,
@@ -402,7 +523,7 @@ mod tests {
             kind: Kind::Assignation,
         };
 
-        let _ = inferno(&a_is_b, TypeEnv::default());
+        let _ = inferno(&a_is_b, Env::default());
         // check if types have been created
         assert!(a_is_b.children[0].r#type.borrow().is_some());
         assert!(a_is_b.children[1].r#type.borrow().is_some());
@@ -465,11 +586,11 @@ mod tests {
             kind: Kind::Assignation,
         };
 
-        let mut env = inferno(&a_is_a_num, TypeEnv::default());
+        let mut env = inferno(&a_is_a_num, Env::default());
         // check if type has been created
         assert!(a_is_a_num.children[0].r#type.borrow().is_some());
         assert_eq!(
-            *a_is_a_num.children[0].find(&mut env).borrow(),
+            *a_is_a_num.children[0].find(&mut env.type_env).borrow(),
             Type::Con(TypeCon {
                 name: "u32".into(),
                 args: vec![]
@@ -520,7 +641,7 @@ mod tests {
         };
 
         println!("first call");
-        let mut env = inferno(&a_is_b, TypeEnv::default());
+        let mut env = inferno(&a_is_b, Env::default());
 
         println!("second call");
         env = inferno(&b_is_num, env);
@@ -528,7 +649,7 @@ mod tests {
 
         // check if type has been created
         assert_eq!(
-            *a_is_b.children[0].find(&mut env).borrow(),
+            *a_is_b.children[0].find(&mut env.type_env).borrow(),
             Type::Con(TypeCon {
                 name: "u32".into(),
                 args: vec![]
