@@ -226,10 +226,10 @@ struct TypeEnv {
     /// a -> b
     /// b -> t0
     variables: HashMap<Id, TypePtr>,
-
     /// t0 -> u32
     /// t1 -> bool
     substitutions: HashMap<String, TypePtr>,
+    constraints: Vec<Constraint>,
 }
 
 impl TypeEnv {
@@ -273,6 +273,12 @@ enum Kind {
     Function,
     If,
     Apply,
+}
+
+#[derive(Clone, Debug)]
+enum Constraint {
+    Equals(TypePtr, TypePtr),
+    SubType(TypePtr, TypePtr), // todo
 }
 
 #[derive(Debug, Clone)]
@@ -377,7 +383,10 @@ fn inferno<'a>(ast: &'a Node<'a>, env: TypeEnv) -> TypeEnv {
                 let [left, right] = &ast.children.as_array().unwrap();
                 env = inferno_rec(left, env);
                 env = inferno_rec(right, env);
-                unify(left.find(&mut env), right.find(&mut env), &mut env);
+                let left_type = left.find(&mut env);
+                let right_type = right.find(&mut env);
+                env.constraints
+                    .push(Constraint::Equals(left_type, right_type));
                 ast.set_type_equals(Type::con("()"), &mut env);
             }
             Kind::Var => {}
@@ -388,6 +397,7 @@ fn inferno<'a>(ast: &'a Node<'a>, env: TypeEnv) -> TypeEnv {
                 let arg = &ast.children[0];
                 let arg_type = function_env.fresh();
                 arg.r#type.borrow_mut().replace(arg_type.clone());
+                // todo: just call set_type_equals is working here?
                 function_env.insert(arg.lexem.to_string(), arg_type.clone());
 
                 // infer return's type (body type)
@@ -415,7 +425,8 @@ fn inferno<'a>(ast: &'a Node<'a>, env: TypeEnv) -> TypeEnv {
                 let expected_function_type =
                     Type::con_with_args("->", vec![argument_type, result_type.clone()]);
 
-                unify(function_type, expected_function_type, &mut env);
+                env.constraints
+                    .push(Constraint::Equals(function_type, expected_function_type));
 
                 let result_type = result_type.borrow().find(&env);
                 ast.set_type_equals(result_type, &mut env);
@@ -424,7 +435,18 @@ fn inferno<'a>(ast: &'a Node<'a>, env: TypeEnv) -> TypeEnv {
         env
     }
 
-    inferno_rec(&ast, env)
+    solve(inferno_rec(&ast, env))
+}
+
+fn solve(mut env: TypeEnv) -> TypeEnv {
+    let constraints: Vec<Constraint> = env.constraints.drain(..).collect();
+    for constraint in constraints {
+        match constraint {
+            Constraint::Equals(a, b) => unify(a, b, &mut env),
+            _ => todo!(),
+        }
+    }
+    env
 }
 
 /* TESTS */
