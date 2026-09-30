@@ -7,6 +7,7 @@
       clippy
       rustfmt
       rustc
+      # TODO: add rust-src
     ];
 
   }

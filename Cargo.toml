@@ -2,6 +2,7 @@
 name = "hindley_milner_rs"
 version = "0.1.0"
 edition = "2024"
+authors = [ "Adrien ZINGER" ]
 
 [dependencies]
 parking_lot = "0.12.5"

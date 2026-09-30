@@ -1,3 +1,14 @@
+// TODO:
+//
+// Language server rust-analyzer:
+//
+// Workspace `/home/azinger/Documents/projects/hindley_milner_rs/Cargo.toml` has sysroot errors: can't load standard library from sysroot
+// /nix/store/nwsrya1c3y3dzgacw1x79y85989i63s0-rustc-1.95.0
+// (discovered via `rustc --print sysroot`)
+// try installing `rust-src` the same way you installed `rustc`
+//
+// rustup add rust-src
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -445,6 +456,44 @@ mod tests {
             *input.get_type(&mut env).borrow(),
             Type::Var(TypeVar { name: "a".into() })
         );
+    }
+
+    #[test]
+    fn function_decl() {
+        // push: (list 'a, 'a) -> ()
+
+        // let a = [] # a: list u32
+        // push(a /* TypeCon("[]", [T]) */, 42 /* T */)
+        // push(a, "hello") # type error on that line
+        //
+        // a = b
+        // b = 42
+        //
+        // TypeVar(a) = TypeVar(b)
+        // TypeVar(b) = 'u32
+        //
+        // TypeVar(a) = TypeCon("[]", [TypeVar("t0")])
+        //
+        // apply :
+        // unification TypeCon("[]", [TypeCon("u32")]) avec TypeVar(a) = TypeCon("[]", [TypeVar("t0")])
+
+        // Version 2 plus dure, une HashMap?
+        //
+        // let x = {} # JSON-like notation ^^' ?!
+        // key = "a"
+        // value = 42
+        //
+        // push2: (map 'a 'b, 'a, 'b) -> ()
+        // push2(x, key, value)
+        //
+        // can push2 be called push?
+        // function are like variables (same scoping) -> push et push2
+        // function are top level thingies -> overkill?
+        //
+        //
+        // x : []
+        // x : ['a]
+        // x : ['a, ...]
     }
 
     #[test]
