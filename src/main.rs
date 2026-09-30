@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::rc::Rc;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static NEXT_TYPE_VAR: AtomicUsize = AtomicUsize::new(0);
+
 /// Dummy implementation of a Damas-Hindley-Milner inference algorithm in Rust
 ///
 /// AST (with some explicit type annotations?) -> AST with every node typed!
@@ -73,7 +77,6 @@ fn main() {
 #[derive(Debug, PartialEq, Clone)]
 struct TypeVar {
     name: String,
-    eq: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -146,9 +149,7 @@ impl Type {
     fn find(&self, env: &TypeEnv) -> TypePtr {
         match self {
             Type::Var(var) => {
-                if let Some(eq) = &var.eq {
-                    let ty = env.get(eq).unwrap_or_else(|| panic!("type {eq} not found"));
-
+                if let Some(ty) = env.get_substitution(var) {
                     ty.borrow().find(env)
                 } else {
                     self.clone().into()
@@ -167,11 +168,7 @@ impl Type {
     }
 
     fn var(name: &str) -> TypePtr {
-        Type::Var(TypeVar {
-            name: name.into(),
-            eq: None,
-        })
-        .into()
+        Type::Var(TypeVar { name: name.into() }).into()
     }
 
     fn con(name: &str) -> TypePtr {
@@ -202,14 +199,6 @@ impl Type {
         }
     }
 
-    fn set_eq(&mut self, eq: String) {
-        println!("type {} set eq {eq}", self.name());
-        match self {
-            Type::Var(c) => c.eq = Some(eq),
-            _ => {}
-        }
-    }
-
     fn args(&self) -> Vec<TypePtr> {
         match self {
             Type::Con(c) => c.args.clone(),
@@ -220,7 +209,44 @@ impl Type {
 
 type Id = String;
 type TypePtr = Rc<RefCell<Type>>;
-type TypeEnv = HashMap<Id, TypePtr>;
+
+#[derive(Default, Clone, Debug)]
+struct TypeEnv {
+    /// a -> b
+    /// b -> t0
+    variables: HashMap<Id, TypePtr>,
+
+    /// t0 -> u32
+    /// t1 -> bool
+    substitutions: HashMap<String, TypePtr>,
+}
+
+impl TypeEnv {
+    fn get(&self, name: &str) -> Option<&TypePtr> {
+        self.variables.get(name)
+    }
+
+    fn insert(&mut self, name: String, ty: TypePtr) -> Option<TypePtr> {
+        self.variables.insert(name, ty)
+    }
+
+    fn substitute(&mut self, var: &TypeVar, ty: TypePtr) {
+        self.substitutions.insert(var.name.clone(), ty);
+    }
+
+    fn get_substitution(&self, var: &TypeVar) -> Option<TypePtr> {
+        self.substitutions.get(&var.name).cloned()
+    }
+
+    /// Create a globally fresh type variable.
+    ///
+    /// Relaxed ordering is enough: we only need every returned
+    /// integer to be unique.
+    fn fresh(&self) -> TypePtr {
+        let id = NEXT_TYPE_VAR.fetch_add(1, Ordering::Relaxed);
+        Type::var(&format!("t{id}"))
+    }
+}
 
 #[derive(Default, Clone)]
 struct Env<'a> {
@@ -248,65 +274,17 @@ struct Node<'a> {
 
 impl Node<'_> {
     fn find(&self, env: &mut TypeEnv) -> TypePtr {
-        let mut ty = self.get_type(env);
-        let mut limit = 10;
-        while let Type::Var(type_var) = ty.clone().borrow().clone() {
-            limit -= 1;
-            if limit == 0 {
-                panic!("too much find");
-            }
-            if let Some(type_eq) = &type_var.eq {
-                println!("try get {type_eq}");
-                ty = env.get(type_eq).unwrap().clone();
-            } else {
-                break;
-            }
-        }
-        println!("end");
-        ty
-    }
-
-    fn find_recursive(&self, env: &mut TypeEnv) -> TypePtr {
-        fn resolve(ty: TypePtr, env: &mut TypeEnv) -> TypePtr {
-            let current = ty.borrow().clone();
-
-            match current {
-                Type::Var(var) => {
-                    if let Some(eq) = var.eq {
-                        let next = env
-                            .get(&eq)
-                            .unwrap_or_else(|| panic!("type variable {eq} not found"))
-                            .clone();
-
-                        resolve(next, env)
-                    } else {
-                        ty
-                    }
-                }
-
-                Type::Con(con) => {
-                    let args = con.args.into_iter().map(|arg| resolve(arg, env)).collect();
-
-                    Type::con_with_args(&con.name, args)
-                }
-
-                Type::Scheme(scheme) => {
-                    let resolved_ty = resolve(scheme.ty.clone(), env);
-
-                    Type::scheme(scheme.for_all.clone(), resolved_ty)
-                }
-            }
-        }
-
         let ty = self.get_type(env);
-        resolve(ty, env)
+        let result = ty.borrow().find(env);
+        result
     }
 
     fn get_type(&self, env: &mut TypeEnv) -> TypePtr {
         if let Some(ty) = env.get(self.lexem) {
-            println!("get {} from env: {:?}", self.lexem, ty.clone());
+            println!("get {} from env: {:?}", self.lexem, ty);
+            let ty = ty.clone();
             let _ = self.r#type.borrow_mut().insert(ty.clone());
-            ty.clone()
+            ty
         } else {
             let ty = self
                 .r#type
@@ -321,47 +299,63 @@ impl Node<'_> {
 
     fn set_type_equals(&self, ty: TypePtr, env: &mut TypeEnv) {
         println!("enter: make {}'s type equals: {:?}", self.lexem, ty);
-        let name = ty.borrow().name();
-        env.insert(name.clone(), ty.clone());
-        let ty_found = self.find(env);
-        let ty_mut = &mut ty_found.borrow_mut();
-        ty_mut.set_eq(name);
-        println!("exit: make {}'s type equals: {:?}", self.lexem, ty);
+
+        let current = self.get_type(env);
+        let current_type = current.borrow().clone();
+
+        match current_type {
+            Type::Var(var) => {
+                env.substitute(&var, ty);
+            }
+            _ => {
+                unify(current, ty, env);
+            }
+        }
     }
 }
 
 /* IMPLEMENTATION */
 
 /// Merge r#type. If everything ok, left ends to be the same as right. Inplace function
-fn unify<'a>(left: TypePtr, right: TypePtr) {
+fn unify(left: TypePtr, right: TypePtr, env: &mut TypeEnv) {
+    let left = left.borrow().find(env);
+    let right = right.borrow().find(env);
+
     let lty = left.borrow().clone();
     let rty = right.borrow().clone();
-    match (lty, &rty) {
-        (Type::Var(_), _) => {
-            // todo check if were not creating a loop, and also implement a true make_equals
-            left.borrow_mut().set_eq(rty.name());
+
+    match (lty, rty) {
+        (Type::Var(left_var), Type::Var(right_var)) if left_var.name == right_var.name => {
+            // Same variable: nothing to do.
         }
-        (_, Type::Var(_)) => unify(right, left),
 
-        (Type::Con(ty_left), Type::Con(ty_right)) => {
-            let mut ret = ty_left.clone();
+        (Type::Var(var), _) => {
+            // TODO: occurs check
+            env.substitute(&var, right);
+        }
 
-            if ty_left.name != ty_right.name {
-                panic!("unify failed: name unmatch");
+        (_, Type::Var(_)) => {
+            unify(right, left, env);
+        }
+
+        (Type::Con(left_con), Type::Con(right_con)) => {
+            if left_con.name != right_con.name {
+                panic!("unify failed: {} != {}", left_con.name, right_con.name);
             }
 
-            if ty_left.args.len() != ty_right.args.len() {
+            if left_con.args.len() != right_con.args.len() {
                 panic!("unify failed: args size");
             }
 
-            for (a, b) in ret.args.iter_mut().zip(ty_right.args.iter().cloned()) {
-                println!("con unify {a:?} and {b:?}");
-                let r = unify(a.clone(), b);
-                println!("con unify res {r:?}");
+            for (left_arg, right_arg) in left_con.args.into_iter().zip(right_con.args.into_iter()) {
+                unify(left_arg, right_arg, env);
             }
         }
-        _ => todo!(),
-    };
+
+        (Type::Scheme(_), _) | (_, Type::Scheme(_)) => {
+            todo!("scheme unification")
+        }
+    }
 }
 
 fn inferno<'a>(ast: &'a Node<'a>, env: TypeEnv) -> TypeEnv {
@@ -372,56 +366,55 @@ fn inferno<'a>(ast: &'a Node<'a>, env: TypeEnv) -> TypeEnv {
                 let [left, right] = &ast.children.as_array().unwrap();
                 env = inferno_rec(left, env);
                 env = inferno_rec(right, env);
-                unify(left.find(&mut env), right.find(&mut env));
+                unify(left.find(&mut env), right.find(&mut env), &mut env);
                 ast.set_type_equals(Type::con("()"), &mut env);
             }
             Kind::Var => {}
             Kind::Function => {
                 let mut function_env = env.clone();
-                // fresh variable for the function argument
+
+                // Here we have an issue when:
+                // a = 42
+                // let foo = fn(a) -> ...
+                //
+                // we need to "bind" a fresh variable in the function's env
                 let arg = &ast.children[0];
-                println!("get argument type");
                 let arg_type = arg.get_type(&mut function_env);
-
-                println!("infer function body");
                 function_env = inferno_rec(&ast.children[1], function_env);
-                let body_type = ast.children[1].get_type(&mut function_env);
 
-                println!("create function type");
-                let ty = Type::con_with_args("->", vec![arg_type, body_type]).into();
+                let body_type = ast.children[1].find(&mut function_env);
+                let arg_type = {
+                    let resolved = arg_type.borrow().find(&function_env);
+                    resolved
+                };
+                let ty = Type::con_with_args("->", vec![arg_type, body_type]);
                 ast.set_type_equals(ty, &mut env);
             }
             Kind::If => todo!(),
             Kind::Apply => {
-                // Infer argument type
-                env = inferno_rec(&ast.children[1], env);
-
                 let [function, argument] = &ast.children[..] else {
-                    panic!("unexpected apply children size")
+                    panic!("unexpected apply children size");
                 };
+
+                // Infer both sides independently.
+                env = inferno_rec(function, env);
+                env = inferno_rec(argument, env);
+
                 let function_type = function.find(&mut env);
                 let argument_type = argument.find(&mut env);
 
-                // Define function arguments in the envirronment temporary
-                let mut tmp = env.clone();
-                tmp.insert(
-                    function_type.borrow().args()[0].borrow().name(),
-                    function_type.borrow().args()[0].clone(),
-                );
-                tmp.insert(
-                    function_type.borrow().args()[1].borrow().name(),
-                    function_type.borrow().args()[1].clone(),
-                );
-
-                let result_type = Type::var("fresh_result");
+                let result_type = env.fresh();
                 let expected_function_type =
-                    Type::con_with_args("->", vec![argument_type.clone(), result_type.clone()]);
+                    Type::con_with_args("->", vec![argument_type, result_type.clone()]);
 
-                println!("\n\nunify functions");
+                unify(function_type, expected_function_type, &mut env);
 
-                unify(expected_function_type, function_type);
+                let result_type = {
+                    let resolved = result_type.borrow().find(&env);
+                    resolved
+                };
 
-                ast.set_type_equals(result_type.borrow().find(&mut tmp), &mut env);
+                ast.set_type_equals(result_type, &mut env);
             }
         }
         env
@@ -450,10 +443,7 @@ mod tests {
         // check if type has been created
         assert_eq!(
             *input.get_type(&mut env).borrow(),
-            Type::Var(TypeVar {
-                name: "a".into(),
-                eq: None
-            })
+            Type::Var(TypeVar { name: "a".into() })
         );
     }
 
@@ -507,10 +497,10 @@ mod tests {
         println!("env\n\n{env:?}\n\n");
 
         assert_eq!(
-            *apply_id.get_type(&mut env).borrow(),
-            Type::Var(TypeVar {
-                name: "id()".into(),
-                eq: Some("u32".to_string())
+            *apply_id.find(&mut env).borrow(),
+            Type::Con(TypeCon {
+                name: "u32".into(),
+                args: vec![]
             })
         );
     }
@@ -655,7 +645,6 @@ mod tests {
             ty_a,
             Type::Var(TypeVar {
                 name: "a".to_string(),
-                eq: None
             })
         );
     }
