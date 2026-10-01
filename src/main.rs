@@ -427,36 +427,64 @@ fn variant_or_bottom(tag: &str, payload: TypePtr) -> TypePtr {
     }
 }
 
+/// See meet-join algorithm. That methods creates the join of
+/// two set-theoretical types.
 fn join(a: TypePtr, b: TypePtr) -> TypePtr {
-    if is_bottom(&a) || is_top(&b) {
+    // When one is everything, return everything.
+    if is_top(&a) {
+        return a;
+    } else if is_top(&b) {
         return b;
     }
 
-    if is_bottom(&b) || is_top(&a) || same(&a, &b) {
+    // When one is nothing, return the other
+    if is_bottom(&a) {
+        return b;
+    } else if is_bottom(&b) {
         return a;
     }
 
+    // If both are the same, it doesn't matter, return one of them
+    if same(&a, &b) {
+        return a;
+    }
+
+    // in any other case, return the union
     Type::union(a, b)
 }
 
+/// See meet-join algorithm. That methods creates the meet of two
+/// set theoretical types (union, bottom, variants, etc...)
 fn meet(a: TypePtr, b: TypePtr) -> TypePtr {
+    // if both are bottom, the meet of them is also a bottom
     if is_bottom(&a) || is_bottom(&b) {
         return Type::bottom();
     }
 
+    // If "a" is everything, the meet (like the intersection) is b.
+    // Whether b is everything or nothing too.
     if is_top(&a) {
         return b;
     }
 
-    if is_top(&b) || same(&a, &b) {
+    // If "b" is everything, return a. (like the previous condition, symetricaly)
+    if is_top(&b) {
+        return a;
+    }
+
+    // If both are equals, return one of them, it doesn't matter.
+    if same(&a, &b) {
         return a;
     }
 
     // A ∩ ¬B = A \ B
+    //
+    // If "b" is a negation, take the excluded and substract them from "a"
     if let Type::Negation(excluded) = b.borrow().clone() {
         return subtract(a, excluded);
     }
 
+    // Same thing but with "a"
     if let Type::Negation(excluded) = a.borrow().clone() {
         return subtract(b, excluded);
     }
@@ -475,6 +503,7 @@ fn meet(a: TypePtr, b: TypePtr) -> TypePtr {
         return if ta == tb {
             variant_or_bottom(ta, meet(pa.clone(), pb.clone()))
         } else {
+            // Not the same variant. But should I meet pa and pb in that case?
             Type::bottom()
         };
     }
@@ -483,6 +512,9 @@ fn meet(a: TypePtr, b: TypePtr) -> TypePtr {
     Type::intersection(a, b)
 }
 
+// Let's say t1 = 'A(u32) V 'B(bool)
+// and t2 = 'A(_).
+// so t1 \ t2 = 'B(bool), ok?
 fn subtract(a: TypePtr, b: TypePtr) -> TypePtr {
     if is_bottom(&a) || is_top(&b) || same(&a, &b) {
         return Type::bottom();
@@ -529,30 +561,30 @@ fn normalize(t: TypePtr) -> TypePtr {
     let current = t.borrow().clone();
 
     match current {
+        // union case, normalize a and b and join them.
         Type::Union(a, b) => join(normalize(a), normalize(b)),
-
+        // Intersection case, normalize a and b and meet them.
         Type::Intersection(a, b) => meet(normalize(a), normalize(b)),
-
         Type::Negation(x) => {
+            // Let start normalize the inner type.
             let x = normalize(x);
-
+            // apply some simplifications in case we have:
+            // 1. negation of nothing (it gives everything instead)
+            // 2. negation of negation. (it gives just the inner type ¬¬A = A)
             match x.borrow().clone() {
                 Type::Bottom => Type::top(),
-
-                // ¬¬A = A
                 Type::Negation(y) => y,
-
                 _ => Type::negation(x.clone()),
             }
         }
-
+        // return the normalized variant type
         Type::Variant(tag, payload) => variant_or_bottom(&tag, normalize(payload)),
-
+        // first leaf, return the type (normalizing recursively its args)
         Type::Con(con) => {
             Type::con_with_args(&con.name, con.args.into_iter().map(normalize).collect())
         }
 
-        // Other types are preserved.
+        // latest leaf, other types are preserved.
         // In particular, we don't normalize under Scheme here.
         other => other.into(),
     }
@@ -604,14 +636,34 @@ fn unify(left: TypePtr, right: TypePtr, env: &mut TypeEnv) {
     }
 }
 
+/// In a match expression context, binding patterns means that we want to
+/// increase our envirronment with selected variables.
+///
+/// For instance, let a Variant be A(num) | B(_).
+/// and that expression to be check:
+///
+/// match x /* our variant */ {
+///     /* 1 */ _ => ...
+///     /* 2 */ v => ...
+///     /* 3 */ A(v) => ...
+/// }
+///
+/// The first arm is a wildcard, we don't need to creates any variable in our
+/// envirronment.
+///
+/// The second arm is a PatternBind. Means that we want "v" to be something we
+/// know (the selected). Supposing x is u32Vbool. the variable v created is
+/// of the same type.
+///
+/// In the latest situation, we know that v must match with the type of the
+/// variant's arm selected. For instance A(u32). v is so binded with u32.
+///
 fn bind_pattern(pattern: &Node, selected: TypePtr, env: &mut TypeEnv) {
     match pattern.kind {
         Kind::PatternWildcard => {}
-
         Kind::PatternBind => {
             env.insert(pattern.lexem.to_owned(), selected);
         }
-
         Kind::PatternTag => {
             let selected = normalize(selected);
 
@@ -624,7 +676,6 @@ fn bind_pattern(pattern: &Node, selected: TypePtr, env: &mut TypeEnv) {
                 Type::Variant(tag, payload) if tag == pattern.lexem => {
                     bind_pattern(&pattern.children[0], payload, env);
                 }
-
                 // The branch is unreachable.
                 Type::Bottom => {
                     bind_pattern(&pattern.children[0], Type::bottom(), env);
@@ -642,6 +693,13 @@ fn bind_pattern(pattern: &Node, selected: TypePtr, env: &mut TypeEnv) {
     }
 }
 
+/// In case of match branch, retreive the type given a pattern.
+/// For instance:
+/// match x {
+///     _ => ... /* top */
+///     v => ... /* top */
+///     A(v) => ... /* type variant A(top) */
+/// }
 fn accepted_type(pattern: &Node) -> TypePtr {
     match pattern.kind {
         // wildcard accept everything, as bottom is the empty set, its negation is fair
@@ -737,13 +795,28 @@ fn inferno<'a>(ast: &'a Node<'a>, env: TypeEnv) -> TypeEnv {
 
                 let mut covered = Type::bottom();
                 let mut result = Type::bottom();
+
+                // Pass through all arms, tracking the covered branches
+                // so the select type is: actual pattern type \ covered.
                 for arm in arms {
                     let [pattern, body] = &arm.children[..] else {
                         panic!("expected a match pattern and its body")
                     };
 
+                    // retreive the type of that arm (we say that it is an accepted
+                    // type because we can enter into that branch)
                     let accepted = accepted_type(pattern);
-                    // t_i = (t0 \ previous_patterns) & <p_i>
+
+                    // But actually, the accepted type by the branch is not the
+                    // "selected".
+
+                    // Let's S the type of the scrutinee, C the
+                    // already covered types. And finally A the one found
+                    // for the arm.
+
+                    // We can already tell that the selected type is in
+                    // S \ C. But that should be intersected
+                    // with A. So t_selected is: (S \ C) ∩ A
                     let selected = normalize(Type::intersection(
                         Type::difference(scrutinee_ty.clone(), covered.clone()),
                         accepted.clone(),
