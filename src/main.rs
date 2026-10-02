@@ -11,77 +11,13 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fmt::Debug;
 use std::rc::Rc;
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_TYPE_VAR: AtomicUsize = AtomicUsize::new(0);
 
-/// Dummy implementation of a Damas-Hindley-Milner inference algorithm in Rust
-///
-/// AST (with some explicit type annotations?) -> AST with every node typed!
-///
-/// References:
-/// - https://bernsteinbear.com/blog/type-inference/
-
-fn main() {
-    let a_is_b = Node {
-        lexem: "=",
-        children: vec![
-            Node {
-                lexem: "a",
-                children: vec![],
-                r#type: Default::default(),
-                kind: Kind::Var,
-            },
-            Node {
-                lexem: "b",
-                children: vec![],
-                r#type: Default::default(),
-                kind: Kind::Var,
-            },
-        ],
-        r#type: Default::default(),
-        kind: Kind::Assignation,
-    };
-
-    let b_is_num = Node {
-        lexem: "=",
-        children: vec![
-            Node {
-                lexem: "b",
-                children: vec![],
-                r#type: Default::default(),
-                kind: Kind::Var,
-            },
-            Node {
-                lexem: "42",
-                children: vec![],
-                r#type: Default::default(),
-                kind: Kind::Num,
-            },
-        ],
-        r#type: Default::default(),
-        kind: Kind::Assignation,
-    };
-
-    println!("first call");
-    let mut env = inferno(&a_is_b, TypeEnv::default());
-
-    println!("second call");
-    env = inferno(&b_is_num, env);
-    println!("start checks");
-
-    // check if type has been created
-    assert_eq!(
-        *a_is_b.children[0].find(&mut env).borrow(),
-        Type::Con(TypeCon {
-            name: "u32".into(),
-            args: vec![]
-        })
-    );
-}
+type Id = String;
+type TypePtr = Rc<RefCell<Type>>;
 
 /* DATASTRUCTURES */
 
@@ -94,53 +30,6 @@ struct TypeVar {
 struct TypeCon {
     name: String,
     args: Vec<TypePtr>,
-}
-
-impl Into<Type> for TypeVar {
-    fn into(self) -> Type {
-        Type::Var(self)
-    }
-}
-
-impl Into<Type> for &TypeVar {
-    fn into(self) -> Type {
-        Type::Var(self.clone())
-    }
-}
-
-impl Into<TypePtr> for Type {
-    fn into(self) -> TypePtr {
-        Rc::new(RefCell::new(self.clone()))
-    }
-}
-
-impl Into<Type> for TypeCon {
-    fn into(self) -> Type {
-        Type::Con(self)
-    }
-}
-
-fn instanciate(ty: &TypePtr) -> Type {
-    let ty_inner = ty.borrow();
-    match &*ty_inner {
-        Type::Scheme(sche) => sche.ty.borrow().clone(),
-        _ => return ty_inner.clone(),
-    }
-}
-
-fn generalize(ty: &TypePtr) -> Type {
-    let ty_inner = ty.borrow();
-    match &*ty_inner {
-        Type::Var(_) => Type::Scheme(Scheme {
-            for_all: vec![ty.clone()],
-            ty: ty.clone(),
-        }),
-        Type::Con(con) => Type::Scheme(Scheme {
-            for_all: con.args.clone(),
-            ty: ty.clone(),
-        }),
-        _ => ty_inner.clone(),
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -167,41 +56,49 @@ struct Scheme {
     ty: TypePtr,
 }
 
+impl From<TypeVar> for Type {
+    fn from(var: TypeVar) -> Self {
+        Type::Var(var)
+    }
+}
+
+impl From<&TypeVar> for Type {
+    fn from(var: &TypeVar) -> Self {
+        Type::Var(var.clone())
+    }
+}
+
+impl From<Type> for TypePtr {
+    fn from(ty: Type) -> Self {
+        Rc::new(RefCell::new(ty))
+    }
+}
+
+impl From<TypeCon> for Type {
+    fn from(con: TypeCon) -> Self {
+        Type::Con(con)
+    }
+}
+
 impl Type {
     fn find(&self, env: &TypeEnv) -> TypePtr {
         match self {
             Type::Var(var) => {
                 if let Some(ty) = env.get_substitution(var) {
-                    ty.borrow().find(env)
+                    ty.resolve(env)
                 } else {
                     self.clone().into()
                 }
             }
             Type::Con(con) => Type::con_with_args(
                 &con.name,
-                con.args.iter().map(|arg| arg.borrow().find(env)).collect(),
+                con.args.iter().map(|arg| arg.resolve(env)).collect(),
             ),
-            Type::Scheme(scheme) => {
-                Type::scheme(scheme.for_all.clone(), scheme.ty.borrow().find(env))
-            }
-            Type::Variant(tag, payload) => {
-                let resolved = payload.borrow().find(env);
-                Type::variant(tag, resolved)
-            }
-            Type::Union(a, b) => {
-                let a = a.borrow().find(env);
-                let b = b.borrow().find(env);
-                Type::union(a, b)
-            }
-            Type::Intersection(a, b) => {
-                let a = a.borrow().find(env);
-                let b = b.borrow().find(env);
-                Type::intersection(a, b)
-            }
-            Type::Negation(ty) => {
-                let resolved = ty.borrow().find(env);
-                Type::negation(resolved)
-            }
+            Type::Scheme(scheme) => Type::scheme(scheme.for_all.clone(), scheme.ty.resolve(env)),
+            Type::Variant(tag, payload) => Type::variant(tag, payload.resolve(env)),
+            Type::Union(a, b) => Type::union(a.resolve(env), b.resolve(env)),
+            Type::Intersection(a, b) => Type::intersection(a.resolve(env), b.resolve(env)),
+            Type::Negation(ty) => Type::negation(ty.resolve(env)),
             Type::Bottom => Type::bottom(),
         }
     }
@@ -211,11 +108,7 @@ impl Type {
     }
 
     fn con(name: &str) -> TypePtr {
-        Type::Con(TypeCon {
-            name: name.into(),
-            args: vec![],
-        })
-        .into()
+        Self::con_with_args(name, vec![])
     }
 
     fn con_with_args(name: &str, args: Vec<TypePtr>) -> TypePtr {
@@ -260,26 +153,278 @@ impl Type {
         Type::intersection(a, Type::negation(b))
     }
 
-    fn name(&self) -> String {
-        match self {
-            Type::Con(c) => c.name.clone(),
-            Type::Var(v) => v.name.clone(),
-            Type::Scheme(s) => s.ty.borrow().name(),
-
-            _ => todo!(),
-        }
+    fn function(argument: TypePtr, result: TypePtr) -> TypePtr {
+        Self::con_with_args("->", vec![argument, result])
     }
 
-    fn args(&self) -> Vec<TypePtr> {
-        match self {
-            Type::Con(c) => c.args.clone(),
-            _ => vec![],
+    // A variant carrying an impossible payload is itself empty.
+    fn variant_or_bottom(tag: &str, payload: TypePtr) -> TypePtr {
+        if payload.is_bottom() {
+            Type::bottom()
+        } else {
+            Type::variant(tag, payload)
         }
     }
 }
 
-type Id = String;
-type TypePtr = Rc<RefCell<Type>>;
+/* TYPE OPERATIONS */
+
+/// Operations on shared type pointers. An extension trait keeps the
+/// Rc<RefCell<Type>> representation while allowing method syntax.
+trait TypePtrExt {
+    fn resolve(&self, env: &TypeEnv) -> TypePtr;
+    fn same(&self, other: &TypePtr) -> bool;
+    fn is_bottom(&self) -> bool;
+    fn is_top(&self) -> bool;
+    fn is_open_variant(&self, tag: &str) -> bool;
+    fn join(self, other: TypePtr) -> TypePtr;
+    fn meet(self, other: TypePtr) -> TypePtr;
+    fn subtract(self, other: TypePtr) -> TypePtr;
+    fn normalize(self) -> TypePtr;
+    fn generalize(&self) -> Type;
+    fn instantiate(&self) -> Type;
+}
+
+impl TypePtrExt for TypePtr {
+    /// Binds with `find`
+    fn resolve(&self, env: &TypeEnv) -> TypePtr {
+        self.borrow().find(env)
+    }
+
+    fn same(&self, b: &TypePtr) -> bool {
+        *self.borrow() == *b.borrow()
+    }
+
+    fn is_bottom(&self) -> bool {
+        matches!(&*self.borrow(), Type::Bottom)
+    }
+
+    fn is_top(&self) -> bool {
+        match &*self.borrow() {
+            Type::Negation(x) => x.is_bottom(),
+            _ => false,
+        }
+    }
+
+    ///  Helper to check if a type is an open variant (a variant with an inner type
+    ///  that can be anything. It occurs when:
+    ///  fn unwrap(x) {
+    ///      match x {
+    ///          'A(v) => v     // here, the type of x ɑ is a subtype of 'A(Top)
+    ///      }
+    ///  }
+    fn is_open_variant(&self, tag: &str) -> bool {
+        match &*self.borrow() {
+            Type::Variant(name, payload) => name == tag && payload.is_top(),
+
+            _ => false,
+        }
+    }
+
+    /// See meet-join algorithm. That methods creates the join of
+    /// two set-theoretical types.
+    fn join(self, b: TypePtr) -> TypePtr {
+        let a = self;
+        // When one is everything, return everything.
+        if a.is_top() {
+            return a;
+        } else if b.is_top() {
+            return b;
+        }
+
+        // When one is nothing, return the other
+        if a.is_bottom() {
+            return b;
+        } else if b.is_bottom() {
+            return a;
+        }
+
+        // If both are the same, it doesn't matter, return one of them
+        if a.same(&b) {
+            return a;
+        }
+
+        // in any other case, return the union
+        Type::union(a, b)
+    }
+
+    /// See meet-join algorithm. That methods creates the meet of two
+    /// set theoretical types (union, bottom, variants, etc...)
+    fn meet(self, b: TypePtr) -> TypePtr {
+        let a = self;
+        // if both are bottom, the meet of them is also a bottom
+        if a.is_bottom() || b.is_bottom() {
+            return Type::bottom();
+        }
+
+        // If "a" is everything, the meet (like the intersection) is b.
+        // Whether b is everything or nothing too.
+        if a.is_top() {
+            return b;
+        }
+
+        // If "b" is everything, return a. (like the previous condition, symetricaly)
+        if b.is_top() {
+            return a;
+        }
+
+        // If both are equals, return one of them, it doesn't matter.
+        if a.same(&b) {
+            return a;
+        }
+
+        // A ∩ ¬B = A \ B
+        //
+        // If "b" is a negation, take the excluded and substract them from "a"
+        if let Type::Negation(excluded) = b.borrow().clone() {
+            return a.subtract(excluded);
+        }
+
+        // Same thing but with "a"
+        if let Type::Negation(excluded) = a.borrow().clone() {
+            return b.subtract(excluded);
+        }
+
+        // (A ∪ B) ∩ C = (A ∩ C) ∪ (B ∩ C)
+        if let Type::Union(l, r) = a.borrow().clone() {
+            return l.meet(b.clone()).join(r.meet(b));
+        }
+
+        if let Type::Union(l, r) = b.borrow().clone() {
+            return a.clone().meet(l).join(a.meet(r));
+        }
+
+        // Different variant tags are disjoint.
+        if let (Type::Variant(ta, pa), Type::Variant(tb, pb)) = (&*a.borrow(), &*b.borrow()) {
+            return if ta == tb {
+                Type::variant_or_bottom(ta, pa.clone().meet(pb.clone()))
+            } else {
+                // Not the same variant. But should I meet pa and pb in that case?
+                Type::bottom()
+            };
+        }
+
+        // Unknown case: retain the symbolic intersection.
+        Type::intersection(a, b)
+    }
+
+    // Let's say t1 = 'A(u32) V 'B(bool)
+    // and t2 = 'A(_).
+    // so t1 \ t2 = 'B(bool), ok?
+    fn subtract(self, b: TypePtr) -> TypePtr {
+        let a = self;
+        if a.is_bottom() || b.is_top() || a.same(&b) {
+            return Type::bottom();
+        }
+
+        if b.is_bottom() {
+            return a;
+        }
+
+        // A \ ¬B = A ∩ B
+        if let Type::Negation(x) = b.borrow().clone() {
+            return a.meet(x);
+        }
+
+        // (A ∪ B) \ C
+        if let Type::Union(l, r) = a.borrow().clone() {
+            return l.subtract(b.clone()).join(r.subtract(b));
+        }
+
+        // A \ (B ∪ C)
+        if let Type::Union(l, r) = b.borrow().clone() {
+            return a.subtract(l).subtract(r);
+        }
+
+        // (A ∩ B) \ C = (A \ C) ∩ B
+        if let Type::Intersection(l, r) = a.borrow().clone() {
+            return l.subtract(b).meet(r);
+        }
+
+        // Variant-specific difference.
+        if let (Type::Variant(ta, pa), Type::Variant(tb, pb)) = (&*a.borrow(), &*b.borrow()) {
+            return if ta == tb {
+                Type::variant_or_bottom(ta, pa.clone().subtract(pb.clone()))
+            } else {
+                a.clone()
+            };
+        }
+
+        // Top \ B = ¬B
+        if a.is_top() {
+            return Type::negation(b);
+        }
+
+        // Cannot simplify further.
+        Type::difference(a, b)
+    }
+
+    fn normalize(self) -> TypePtr {
+        let current = self.borrow().clone();
+
+        match current {
+            // union case, normalize a and b and join them.
+            Type::Union(a, b) => a.normalize().join(b.normalize()),
+            // Intersection case, normalize a and b and meet them.
+            Type::Intersection(a, b) => a.normalize().meet(b.normalize()),
+            Type::Negation(x) => {
+                // Let start normalize the inner type.
+                let x = x.normalize();
+                // apply some simplifications in case we have:
+                // 1. negation of nothing (it gives everything instead)
+                // 2. negation of negation. (it gives just the inner type ¬¬A = A)
+                let inner = x.borrow().clone();
+                match inner {
+                    Type::Bottom => Type::top(),
+                    Type::Negation(y) => y,
+                    _ => Type::negation(x),
+                }
+            }
+            // return the normalized variant type
+            Type::Variant(tag, payload) => Type::variant_or_bottom(&tag, payload.normalize()),
+            // first leaf, return the type (normalizing recursively its args)
+            Type::Con(con) => Type::con_with_args(
+                &con.name,
+                con.args.into_iter().map(TypePtrExt::normalize).collect(),
+            ),
+
+            // latest leaf, other types are preserved.
+            // In particular, we don't normalize under Scheme here.
+            other => other.into(),
+        }
+    }
+
+    fn generalize(&self) -> Type {
+        let ty_inner = self.borrow();
+        match &*ty_inner {
+            Type::Var(_) => Type::Scheme(Scheme {
+                for_all: vec![self.clone()],
+                ty: self.clone(),
+            }),
+            Type::Con(con) => Type::Scheme(Scheme {
+                for_all: con.args.clone(),
+                ty: self.clone(),
+            }),
+            _ => ty_inner.clone(),
+        }
+    }
+
+    fn instantiate(&self) -> Type {
+        let ty_inner = self.borrow();
+        match &*ty_inner {
+            Type::Scheme(sche) => sche.ty.borrow().clone(),
+            _ => ty_inner.clone(),
+        }
+    }
+}
+
+/* ENVIRONMENT */
+
+#[derive(Clone, Debug)]
+enum Constraint {
+    Equals(TypePtr, TypePtr),
+    Subtype(TypePtr, TypePtr), // todo
+}
 
 #[derive(Default, Clone, Debug)]
 struct TypeEnv {
@@ -319,11 +464,7 @@ impl TypeEnv {
     }
 }
 
-#[derive(Default, Clone)]
-struct Env<'a> {
-    type_env: TypeEnv,
-    functions: HashMap<Id, Node<'a>>,
-}
+/* AST AND INFERENCE */
 
 #[derive(Debug, Clone)]
 enum Kind {
@@ -343,12 +484,6 @@ enum Kind {
     PatternBind,     // A(a) => ..
 }
 
-#[derive(Clone, Debug)]
-enum Constraint {
-    Equals(TypePtr, TypePtr),
-    Subtype(TypePtr, TypePtr), // todo
-}
-
 #[derive(Debug, Clone)]
 struct Node<'a> {
     lexem: &'a str,
@@ -357,18 +492,30 @@ struct Node<'a> {
     r#type: RefCell<Option<TypePtr>>,
 }
 
-impl Node<'_> {
+impl<'a> Node<'a> {
+    // Small AST constructor to keep examples and tests readable.
+    fn new(lexem: &'a str, kind: Kind, children: Vec<Self>) -> Self {
+        Self {
+            lexem,
+            kind,
+            children,
+            r#type: RefCell::default(),
+        }
+    }
+
+    fn set_type(&self, ty: TypePtr) {
+        self.r#type.borrow_mut().replace(ty);
+    }
+
     fn find(&self, env: &mut TypeEnv) -> TypePtr {
-        let ty = self.get_type(env);
-        let result = ty.borrow().find(env);
-        result
+        self.get_type(env).resolve(env)
     }
 
     fn get_type(&self, env: &mut TypeEnv) -> TypePtr {
         if let Some(ty) = env.get(self.lexem) {
             println!("get {} from env: {:?}", self.lexem, ty);
             let ty = ty.clone();
-            let _ = self.r#type.borrow_mut().insert(ty.clone());
+            self.set_type(ty.clone());
             ty
         } else {
             let ty = self
@@ -397,227 +544,275 @@ impl Node<'_> {
             }
         }
     }
-}
 
-/* IMPLEMENTATION */
-
-/* TODO, that should be implementation of TypePtr. */
-
-fn same(a: &TypePtr, b: &TypePtr) -> bool {
-    *a.borrow() == *b.borrow()
-}
-
-fn is_bottom(t: &TypePtr) -> bool {
-    matches!(&*t.borrow(), Type::Bottom)
-}
-
-fn is_top(t: &TypePtr) -> bool {
-    match &*t.borrow() {
-        Type::Negation(x) => is_bottom(x),
-        _ => false,
-    }
-}
-
-// A variant carrying an impossible payload is itself empty.
-fn variant_or_bottom(tag: &str, payload: TypePtr) -> TypePtr {
-    if is_bottom(&payload) {
-        Type::bottom()
-    } else {
-        Type::variant(tag, payload)
-    }
-}
-
-///  Helper to check if a type is an open variant (a variant with an inner type
-///  that can be anything. It occurs when:
-///  fn unwrap(x) {
-///      match x {
-///          'A(v) => v     // here, the type of x ɑ is a subtype of 'A(Top)
-///      }
-///  }
-fn is_open_variant(ty: &TypePtr, tag: &str) -> bool {
-    match ty.borrow().clone() {
-        Type::Variant(name, payload) => name == tag && is_top(&payload),
-
-        _ => false,
-    }
-}
-
-/// See meet-join algorithm. That methods creates the join of
-/// two set-theoretical types.
-fn join(a: TypePtr, b: TypePtr) -> TypePtr {
-    // When one is everything, return everything.
-    if is_top(&a) {
-        return a;
-    } else if is_top(&b) {
-        return b;
-    }
-
-    // When one is nothing, return the other
-    if is_bottom(&a) {
-        return b;
-    } else if is_bottom(&b) {
-        return a;
-    }
-
-    // If both are the same, it doesn't matter, return one of them
-    if same(&a, &b) {
-        return a;
-    }
-
-    // in any other case, return the union
-    Type::union(a, b)
-}
-
-/// See meet-join algorithm. That methods creates the meet of two
-/// set theoretical types (union, bottom, variants, etc...)
-fn meet(a: TypePtr, b: TypePtr) -> TypePtr {
-    // if both are bottom, the meet of them is also a bottom
-    if is_bottom(&a) || is_bottom(&b) {
-        return Type::bottom();
-    }
-
-    // If "a" is everything, the meet (like the intersection) is b.
-    // Whether b is everything or nothing too.
-    if is_top(&a) {
-        return b;
-    }
-
-    // If "b" is everything, return a. (like the previous condition, symetricaly)
-    if is_top(&b) {
-        return a;
-    }
-
-    // If both are equals, return one of them, it doesn't matter.
-    if same(&a, &b) {
-        return a;
-    }
-
-    // A ∩ ¬B = A \ B
-    //
-    // If "b" is a negation, take the excluded and substract them from "a"
-    if let Type::Negation(excluded) = b.borrow().clone() {
-        return subtract(a, excluded);
-    }
-
-    // Same thing but with "a"
-    if let Type::Negation(excluded) = a.borrow().clone() {
-        return subtract(b, excluded);
-    }
-
-    // (A ∪ B) ∩ C = (A ∩ C) ∪ (B ∩ C)
-    if let Type::Union(l, r) = a.borrow().clone() {
-        return join(meet(l, b.clone()), meet(r, b));
-    }
-
-    if let Type::Union(l, r) = b.borrow().clone() {
-        return join(meet(a.clone(), l), meet(a, r));
-    }
-
-    // Different variant tags are disjoint.
-    if let (Type::Variant(ta, pa), Type::Variant(tb, pb)) = (&*a.borrow(), &*b.borrow()) {
-        return if ta == tb {
-            variant_or_bottom(ta, meet(pa.clone(), pb.clone()))
-        } else {
-            // Not the same variant. But should I meet pa and pb in that case?
-            Type::bottom()
-        };
-    }
-
-    // Unknown case: retain the symbolic intersection.
-    Type::intersection(a, b)
-}
-
-// Let's say t1 = 'A(u32) V 'B(bool)
-// and t2 = 'A(_).
-// so t1 \ t2 = 'B(bool), ok?
-fn subtract(a: TypePtr, b: TypePtr) -> TypePtr {
-    if is_bottom(&a) || is_top(&b) || same(&a, &b) {
-        return Type::bottom();
-    }
-
-    if is_bottom(&b) {
-        return a;
-    }
-
-    // A \ ¬B = A ∩ B
-    if let Type::Negation(x) = b.borrow().clone() {
-        return meet(a, x);
-    }
-
-    // (A ∪ B) \ C
-    if let Type::Union(l, r) = a.borrow().clone() {
-        return join(subtract(l, b.clone()), subtract(r, b));
-    }
-
-    // A \ (B ∪ C)
-    if let Type::Union(l, r) = b.borrow().clone() {
-        return subtract(subtract(a, l), r);
-    }
-
-    // (A ∩ B) \ C = (A \ C) ∩ B
-    if let Type::Intersection(l, r) = a.borrow().clone() {
-        return meet(subtract(l, b.clone()), r);
-    }
-
-    // Variant-specific difference.
-    if let (Type::Variant(ta, pa), Type::Variant(tb, pb)) = (&*a.borrow(), &*b.borrow()) {
-        return if ta == tb {
-            variant_or_bottom(ta, subtract(pa.clone(), pb.clone()))
-        } else {
-            a.clone()
-        };
-    }
-
-    // Top \ B = ¬B
-    if is_top(&a) {
-        return Type::negation(b);
-    }
-
-    // Cannot simplify further.
-    Type::difference(a, b)
-}
-
-fn normalize(t: TypePtr) -> TypePtr {
-    let current = t.borrow().clone();
-
-    match current {
-        // union case, normalize a and b and join them.
-        Type::Union(a, b) => join(normalize(a), normalize(b)),
-        // Intersection case, normalize a and b and meet them.
-        Type::Intersection(a, b) => meet(normalize(a), normalize(b)),
-        Type::Negation(x) => {
-            // Let start normalize the inner type.
-            let x = normalize(x);
-            // apply some simplifications in case we have:
-            // 1. negation of nothing (it gives everything instead)
-            // 2. negation of negation. (it gives just the inner type ¬¬A = A)
-            match x.borrow().clone() {
-                Type::Bottom => Type::top(),
-                Type::Negation(y) => y,
-                _ => Type::negation(x.clone()),
+    fn infer(&self, env: &mut TypeEnv) {
+        match self.kind {
+            Kind::Num => self.set_type_equals(Type::con("u32"), env),
+            Kind::Assignation => {
+                let [left, right] = &self.children[..] else {
+                    panic!("expected an assignment target and its value");
+                };
+                left.infer(env);
+                right.infer(env);
+                let left_type = left.find(env);
+                let right_type = right.find(env);
+                env.constraints
+                    .push(Constraint::Equals(left_type, right_type));
+                self.set_type_equals(Type::con("()"), env);
             }
+            Kind::Var => {}
+            Kind::Function => {
+                let mut function_env = env.clone();
+
+                // we need to "bind" a fresh variable in the function's env
+                let arg = &self.children[0];
+                let arg_type = function_env.fresh();
+                arg.set_type(arg_type.clone());
+                function_env.insert(arg.lexem.to_string(), arg_type.clone());
+
+                // infer return's type (body type)
+                self.children[1].infer(&mut function_env);
+                let body_type = self.children[1].find(&mut function_env);
+
+                let arg_type = arg_type.resolve(&function_env);
+                let ty = Type::function(arg_type, body_type);
+                self.set_type_equals(ty, env);
+            }
+            Kind::If => todo!(),
+            Kind::Apply => {
+                let [function, argument] = &self.children[..] else {
+                    panic!("unexpected apply children size");
+                };
+
+                // Infer both sides independently.
+                function.infer(env);
+                argument.infer(env);
+
+                let function_type = function.find(env);
+                let argument_type = argument.find(env);
+
+                let result_type = env.fresh();
+                let expected_function_type = Type::function(argument_type, result_type.clone());
+
+                env.constraints
+                    .push(Constraint::Equals(function_type, expected_function_type));
+
+                let result_type = result_type.resolve(env);
+                self.set_type_equals(result_type, env);
+            }
+            Kind::Variant => {
+                let [argument] = &self.children[..] else {
+                    panic!("unexpected variant children size");
+                };
+
+                // Infer the variant payload.
+                argument.infer(env);
+
+                // Retrieve its inferred type.
+                let argument_type = argument.find(env);
+
+                // Construct the variant type: `Tag(argument_type)
+                let variant_type = Type::variant(self.lexem, argument_type);
+
+                // Store the result directly in the AST node.
+                self.set_type(variant_type);
+            }
+            Kind::Match => self.infer_match(env),
+            _ => panic!("node not managed {self:?}"),
         }
-        // return the normalized variant type
-        Type::Variant(tag, payload) => variant_or_bottom(&tag, normalize(payload)),
-        // first leaf, return the type (normalizing recursively its args)
-        Type::Con(con) => {
-            Type::con_with_args(&con.name, con.args.into_iter().map(normalize).collect())
+    }
+
+    fn infer_match(&self, env: &mut TypeEnv) {
+        // Get the scrutinee and the arms of expression:
+        // match scrutinee {
+        //    arms...
+        // }
+        let scrutinee = &self.children[0];
+        let arms = &self.children[1..];
+
+        scrutinee.infer(env);
+
+        let scrutinee_ty = scrutinee.get_type(env);
+
+        let mut covered = Type::bottom();
+        let mut result = Type::bottom();
+
+        // Pass through all arms, tracking the covered branches
+        // so the select type is: actual pattern type \ covered.
+        for arm in arms {
+            let [pattern, body] = &arm.children[..] else {
+                panic!("expected a match pattern and its body")
+            };
+
+            // retreive the type of that arm (we say that it is an accepted
+            // type because we can enter into that branch)
+            let accepted = pattern.accepted_type();
+
+            // But actually, the accepted type by the branch is not the
+            // "selected".
+
+            // Let's S the type of the scrutinee, C the
+            // already covered types. And finally A the one found
+            // for the arm.
+
+            // We can already tell that the selected type is in
+            // S \ C. But that should be intersected
+            // with A. So t_selected is: (S \ C) ∩ A
+            let selected = Type::intersection(
+                Type::difference(scrutinee_ty.clone(), covered.clone()),
+                accepted.clone(),
+            )
+            .normalize();
+
+            println!("selected: \n\n{selected:#?}\n\n");
+
+            // Save the outer expression bindings.
+            // Substitutions and constraints must survive the branch.
+            // todo just clone?
+            let outer_variables = env.variables.clone();
+
+            // Introduce pattern-bound variables.
+            pattern.bind_pattern(selected, env);
+
+            // Infer the branch body.
+            body.infer(env);
+
+            let branch_ty = body.get_type(env);
+            println!("branch type: \n\n{branch_ty:#?}\n\n");
+
+            // The result is the union of branch results.
+            result = Type::union(result, branch_ty);
+
+            // Restore lexical scope.
+            env.variables = outer_variables;
+
+            // Remember which values have already been matched.
+            covered = Type::union(covered, accepted);
         }
 
-        // latest leaf, other types are preserved.
-        // In particular, we don't normalize under Scheme here.
-        other => other.into(),
+        println!("result: \n\n{result:#?}\n\n");
+        println!("covered: \n\n{covered:#?}\n\n");
+
+        // Exhaustiveness: t0 <= union of accepted patterns.
+        env.constraints
+            .push(Constraint::Subtype(scrutinee_ty, covered));
+
+        self.set_type(result);
+    }
+
+    /// In a match expression context, binding patterns means that we want to
+    /// increase our envirronment with selected variables.
+    ///
+    /// For instance, let a Variant be A(num) | B(_).
+    /// and that expression to be check:
+    ///
+    /// match x /* our variant */ {
+    ///     /* 1 */ _ => ...
+    ///     /* 2 */ v => ...
+    ///     /* 3 */ A(v) => ...
+    /// }
+    ///
+    /// The first arm is a wildcard, we don't need to creates any variable in our
+    /// envirronment.
+    ///
+    /// The second arm is a PatternBind. Means that we want "v" to be something we
+    /// know (the selected). Supposing x is u32Vbool. the variable v created is
+    /// of the same type.
+    ///
+    /// In the latest situation, we know that v must match with the type of the
+    /// variant's arm selected. For instance A(u32). v is so binded with u32.
+    ///
+    /// That function generates symbolic subtype constraints only.
+    fn bind_pattern(&self, selected: TypePtr, env: &mut TypeEnv) {
+        match self.kind {
+            Kind::PatternWildcard => {}
+            Kind::PatternBind => {
+                env.insert(self.lexem.to_owned(), selected);
+            }
+            Kind::PatternTag => {
+                let selected = selected.normalize();
+
+                // Clone the inner Type to release the RefCell borrow.
+                let current = selected.borrow().clone();
+
+                match current {
+                    // The selected type is a variant with the expected tag.
+                    // We can directly extract its payload type.
+                    Type::Variant(tag, payload) if tag == self.lexem => {
+                        self.children[0].bind_pattern(payload, env);
+                    }
+                    // The branch is unreachable.
+                    Type::Bottom => {
+                        self.children[0].bind_pattern(Type::bottom(), env);
+                    }
+
+                    // Other cases require a more complete projection
+                    // or the tallying algorithm.
+                    _ => {
+                        // So in "match x" we have x a number, a type variable
+                        // with no substitution, or anything that is added after
+                        // that comment.
+
+                        // That case is agnostic about the type of x. Actually, anything
+                        // it is, we have here to create a constraints: type of x is a
+                        // subtype of the pattern were looking in.
+
+                        // For instance, the pattern "A(value) => value", accept all
+                        // variant A(T). The type of x (let's write X) must respect that:
+                        // x <= A(T).
+
+                        // But we don't find that directly. Instead, we creates the
+                        // constraint that the selected type is a subtype of something
+                        // we'll get later
+                        let fresh = env.fresh();
+                        env.constraints.push(Constraint::Subtype(
+                            selected,
+                            Type::variant(self.lexem, fresh.clone()),
+                        ));
+
+                        self.children[0].bind_pattern(fresh, env);
+                    }
+                }
+            }
+
+            _ => panic!("unsupported pattern"),
+        }
+    }
+
+    /// In case of match branch, retreive the type given a pattern.
+    /// For instance:
+    /// match x {
+    ///     _ => ... /* top */
+    ///     v => ... /* top */
+    ///     A(v) => ... /* type variant A(top) */
+    /// }
+    fn accepted_type(&self) -> TypePtr {
+        match self.kind {
+            // wildcard accept everything, as bottom is the empty set, its negation is fair
+            Kind::PatternWildcard | Kind::PatternBind => Type::top(),
+            Kind::PatternTag => Type::variant(self.lexem, self.children[0].accepted_type()),
+            _ => panic!("unexpected match subpattern"),
+        }
     }
 }
 
-/* END of TODO note*/
+fn inferno(ast: &Node<'_>, mut env: TypeEnv) -> TypeEnv {
+    ast.infer(&mut env);
+
+    // TODO, I need inferno to not solve anything actually.
+    // (or maybe just the equality constraints).
+    solve(env)
+}
+
+/* UNIFICATION AND CONSTRAINT SOLVING */
 
 /// Merge r#type. If everything ok, left ends to be the same as right. Inplace function
 fn unify(left: TypePtr, right: TypePtr, env: &mut TypeEnv) {
-    let left = left.borrow().find(env);
-    let right = right.borrow().find(env);
+    let left = left.resolve(env);
+    let right = right.resolve(env);
 
-    if same(&left, &right) {
+    if left.same(&right) {
+        // Same variable: nothing to do.
         return;
     }
 
@@ -625,17 +820,14 @@ fn unify(left: TypePtr, right: TypePtr, env: &mut TypeEnv) {
     let rty = right.borrow().clone();
 
     match (lty, rty) {
-        (Type::Var(left_var), Type::Var(right_var)) if left_var.name == right_var.name => {
-            // Same variable: nothing to do.
-        }
-
         (Type::Var(var), _) => {
             // TODO: occurs check
             env.substitute(&var, right);
         }
 
-        (_, Type::Var(_)) => {
-            unify(right, left, env);
+        (_, Type::Var(var)) => {
+            // TODO: occurs check
+            env.substitute(&var, left);
         }
 
         (Type::Con(left_con), Type::Con(right_con)) => {
@@ -647,7 +839,7 @@ fn unify(left: TypePtr, right: TypePtr, env: &mut TypeEnv) {
                 panic!("unify failed: args size");
             }
 
-            for (left_arg, right_arg) in left_con.args.into_iter().zip(right_con.args.into_iter()) {
+            for (left_arg, right_arg) in left_con.args.into_iter().zip(right_con.args) {
                 unify(left_arg, right_arg, env);
             }
         }
@@ -660,263 +852,57 @@ fn unify(left: TypePtr, right: TypePtr, env: &mut TypeEnv) {
     }
 }
 
-/// In a match expression context, binding patterns means that we want to
-/// increase our envirronment with selected variables.
-///
-/// For instance, let a Variant be A(num) | B(_).
-/// and that expression to be check:
-///
-/// match x /* our variant */ {
-///     /* 1 */ _ => ...
-///     /* 2 */ v => ...
-///     /* 3 */ A(v) => ...
-/// }
-///
-/// The first arm is a wildcard, we don't need to creates any variable in our
-/// envirronment.
-///
-/// The second arm is a PatternBind. Means that we want "v" to be something we
-/// know (the selected). Supposing x is u32Vbool. the variable v created is
-/// of the same type.
-///
-/// In the latest situation, we know that v must match with the type of the
-/// variant's arm selected. For instance A(u32). v is so binded with u32.
-///
-/// That function generates symbolic subtype constraints only.
-fn bind_pattern(pattern: &Node, selected: TypePtr, env: &mut TypeEnv) {
-    match pattern.kind {
-        Kind::PatternWildcard => {}
-        Kind::PatternBind => {
-            env.insert(pattern.lexem.to_owned(), selected);
-        }
-        Kind::PatternTag => {
-            let selected = normalize(selected);
+// Solve all the constraints, Equals and Subtypes.
+fn solve(mut env: TypeEnv) -> TypeEnv {
+    let constraints = std::mem::take(&mut env.constraints);
 
-            // Clone the inner Type to release the RefCell borrow.
-            let current = selected.borrow().clone();
+    let mut subtypes = Vec::new();
 
-            match current {
-                // The selected type is a variant with the expected tag.
-                // We can directly extract its payload type.
-                Type::Variant(tag, payload) if tag == pattern.lexem => {
-                    bind_pattern(&pattern.children[0], payload, env);
-                }
-                // The branch is unreachable.
-                Type::Bottom => {
-                    bind_pattern(&pattern.children[0], Type::bottom(), env);
-                }
+    // First pass: resolve equality constraints.
+    for constraint in constraints {
+        match constraint {
+            Constraint::Equals(a, b) => {
+                unify(a, b, &mut env);
+            }
 
-                // Other cases require a more complete projection
-                // or the tallying algorithm.
-                other => {
-                    // So in "match x" we have x a number, a type variable
-                    // with no substitution, or anything that is added after
-                    // that comment.
-
-                    // That case is agnostic about the type of x. Actually, anything
-                    // it is, we have here to create a constraints: type of x is a
-                    // subtype of the pattern were looking in.
-
-                    // For instance, the pattern "A(value) => value", accept all
-                    // variant A(T). The type of x (let's write X) must respect that:
-                    // x <= A(T).
-
-                    // But we don't find that directly. Instead, we creates the
-                    // constraint that the selected type is a subtype of something
-                    // we'll get later
-                    let fresh = env.fresh();
-                    env.constraints.push(Constraint::Subtype(
-                        selected,
-                        Type::variant(pattern.lexem, fresh.clone()),
-                    ));
-
-                    bind_pattern(&pattern.children[0], fresh, env);
-                }
+            Constraint::Subtype(a, b) => {
+                subtypes.push((a, b));
             }
         }
-
-        _ => panic!("unsupported pattern"),
     }
-}
 
-/// In case of match branch, retreive the type given a pattern.
-/// For instance:
-/// match x {
-///     _ => ... /* top */
-///     v => ... /* top */
-///     A(v) => ... /* type variant A(top) */
-/// }
-fn accepted_type(pattern: &Node) -> TypePtr {
-    match pattern.kind {
-        // wildcard accept everything, as bottom is the empty set, its negation is fair
-        Kind::PatternWildcard | Kind::PatternBind => Type::top(),
-        Kind::PatternTag => Type::variant(pattern.lexem, accepted_type(&pattern.children[0])),
-        _ => panic!("unexpected match subpattern"),
-    }
-}
+    solve_single_variant_match(&subtypes, &mut env);
 
-fn inferno<'a>(ast: &'a Node<'a>, env: TypeEnv) -> TypeEnv {
-    fn inferno_rec<'a>(ast: &'a Node<'a>, mut env: TypeEnv) -> TypeEnv {
-        match ast.kind {
-            Kind::Num => ast.set_type_equals(Type::con("u32"), &mut env),
-            Kind::Assignation => {
-                let [left, right] = &ast.children.as_array().unwrap();
-                env = inferno_rec(left, env);
-                env = inferno_rec(right, env);
-                let left_type = left.find(&mut env);
-                let right_type = right.find(&mut env);
-                env.constraints
-                    .push(Constraint::Equals(left_type, right_type));
-                ast.set_type_equals(Type::con("()"), &mut env);
-            }
-            Kind::Var => {}
-            Kind::Function => {
-                let mut function_env = env.clone();
+    // Second pass: check subtype constraints.
+    for (a, b) in subtypes {
+        // Apply the substitutions produced by unify().
+        let left = a.resolve(&env);
+        let right = b.resolve(&env);
 
-                // we need to "bind" a fresh variable in the function's env
-                let arg = &ast.children[0];
-                let arg_type = function_env.fresh();
-                arg.r#type.borrow_mut().replace(arg_type.clone());
-                function_env.insert(arg.lexem.to_string(), arg_type.clone());
+        // A <= B iff A \ B is empty.
+        let remainder = Type::difference(left.clone(), right.clone()).normalize();
 
-                // infer return's type (body type)
-                function_env = inferno_rec(&ast.children[1], function_env);
-                let body_type = ast.children[1].find(&mut function_env);
+        if !remainder.is_bottom() {
+            // that constraint cannot be solved right now. Let store it into
+            // the new env. Furthermore, we can tell that a is b.
 
-                let arg_type = arg_type.borrow().find(&function_env);
-                let ty = Type::con_with_args("->", vec![arg_type, body_type]);
-                ast.set_type_equals(ty, &mut env);
-            }
-            Kind::If => todo!(),
-            Kind::Apply => {
-                let [function, argument] = &ast.children[..] else {
-                    panic!("unexpected apply children size");
-                };
-
-                // Infer both sides independently.
-                env = inferno_rec(function, env);
-                env = inferno_rec(argument, env);
-
-                let function_type = function.find(&mut env);
-                let argument_type = argument.find(&mut env);
-
-                let result_type = env.fresh();
-                let expected_function_type =
-                    Type::con_with_args("->", vec![argument_type, result_type.clone()]);
-
-                env.constraints
-                    .push(Constraint::Equals(function_type, expected_function_type));
-
-                let result_type = result_type.borrow().find(&env);
-                ast.set_type_equals(result_type, &mut env);
-            }
-            Kind::Variant => {
-                let [argument] = &ast.children[..] else {
-                    panic!("unexpected variant children size");
-                };
-
-                // Infer the variant payload.
-                env = inferno_rec(argument, env);
-
-                // Retrieve its inferred type.
-                let argument_type = argument.find(&mut env);
-
-                // Construct the variant type: `Tag(argument_type)
-                let variant_type = Type::variant(ast.lexem, argument_type);
-
-                // Store the result directly in the AST node.
-                ast.r#type.borrow_mut().replace(variant_type);
-            }
-            Kind::Match => {
-                // Get the scrutinee and the arms of expression:
-                // match scrutinee {
-                //    arms...
-                // }
-                let scrutinee = &ast.children[0];
-                let arms = &ast.children[1..];
-
-                env = inferno_rec(scrutinee, env);
-
-                let scrutinee_ty = scrutinee.get_type(&mut env);
-
-                let mut covered = Type::bottom();
-                let mut result = Type::bottom();
-
-                // Pass through all arms, tracking the covered branches
-                // so the select type is: actual pattern type \ covered.
-                for arm in arms {
-                    let [pattern, body] = &arm.children[..] else {
-                        panic!("expected a match pattern and its body")
-                    };
-
-                    // retreive the type of that arm (we say that it is an accepted
-                    // type because we can enter into that branch)
-                    let accepted = accepted_type(pattern);
-
-                    // But actually, the accepted type by the branch is not the
-                    // "selected".
-
-                    // Let's S the type of the scrutinee, C the
-                    // already covered types. And finally A the one found
-                    // for the arm.
-
-                    // We can already tell that the selected type is in
-                    // S \ C. But that should be intersected
-                    // with A. So t_selected is: (S \ C) ∩ A
-                    let selected = normalize(Type::intersection(
-                        Type::difference(scrutinee_ty.clone(), covered.clone()),
-                        accepted.clone(),
-                    ));
-
-                    println!("selected: \n\n{selected:#?}\n\n");
-
-                    // Save the outer expression bindings.
-                    // Substitutions and constraints must survive the branch.
-                    // todo just clone?
-                    let outer_variables = env.variables.clone();
-
-                    // Introduce pattern-bound variables.
-                    bind_pattern(pattern, selected, &mut env);
-
-                    // Infer the branch body.
-                    env = inferno_rec(body, env);
-
-                    let branch_ty = body.get_type(&mut env);
-                    println!("branch type: \n\n{branch_ty:#?}\n\n");
-
-                    // The result is the union of branch results.
-                    result = Type::union(result, branch_ty);
-
-                    // Restore lexical scope.
-                    env.variables = outer_variables;
-
-                    // Remember which values have already been matched.
-                    covered = Type::union(covered, accepted);
-                }
-
-                println!("result: \n\n{result:#?}\n\n");
-                println!("covered: \n\n{covered:#?}\n\n");
-
-                // Exhaustiveness: t0 <= union of accepted patterns.
-                env.constraints
-                    .push(Constraint::Subtype(scrutinee_ty, covered));
-
-                ast.r#type.borrow_mut().replace(result);
-            }
-            _ => panic!("node not managed {ast:?}"),
+            env.constraints.push(Constraint::Subtype(a, b));
+            println!(
+                "could not prove subtype: {:?} <= {:?} (remainder: {:?})",
+                left.borrow(),
+                right.borrow(),
+                remainder.borrow()
+            );
         }
-        env
     }
 
-    // TODO, I need inferno to not solve anything actually.
-    // (or maybe just the equality constraints).
-    solve(inferno_rec(&ast, env))
+    env
 }
 
 fn solve_single_variant_match(constraints: &[(TypePtr, TypePtr)], env: &mut TypeEnv) {
     for (left, right) in constraints {
-        let left = normalize(left.borrow().find(env));
-        let right = normalize(right.borrow().find(env));
+        let left = left.resolve(env).normalize();
+        let right = right.resolve(env).normalize();
 
         // Look for a right-hand side of the form:
         //
@@ -940,9 +926,9 @@ fn solve_single_variant_match(constraints: &[(TypePtr, TypePtr)], env: &mut Type
         };
 
         let alpha = match (a.borrow().clone(), b.borrow().clone()) {
-            (Type::Var(var), _) if is_open_variant(&b, &tag) => var,
+            (Type::Var(var), _) if b.is_open_variant(&tag) => var,
 
-            (_, Type::Var(var)) if is_open_variant(&a, &tag) => var,
+            (_, Type::Var(var)) if a.is_open_variant(&tag) => var,
 
             _ => continue,
         };
@@ -954,15 +940,15 @@ fn solve_single_variant_match(constraints: &[(TypePtr, TypePtr)], env: &mut Type
         // Without it, we cannot globally restrict alpha
         // to the A variant: there might be other branches.
         let exhaustive = constraints.iter().any(|(lo, hi)| {
-            let lo = normalize(lo.borrow().find(env));
-            let hi = normalize(hi.borrow().find(env));
+            let lo = lo.resolve(env).normalize();
+            let hi = hi.resolve(env).normalize();
 
             let is_alpha = match lo.borrow().clone() {
                 Type::Var(v) => v.name == alpha.name,
                 _ => false,
             };
 
-            is_alpha && is_open_variant(&hi, &tag)
+            is_alpha && hi.is_open_variant(&tag)
         });
 
         if !exhaustive {
@@ -991,51 +977,47 @@ fn solve_single_variant_match(constraints: &[(TypePtr, TypePtr)], env: &mut Type
     }
 }
 
-// Solve all the constraints, Equals and Subtypes.
-fn solve(mut env: TypeEnv) -> TypeEnv {
-    let constraints = std::mem::take(&mut env.constraints);
+/// Dummy implementation of a Damas-Hindley-Milner inference algorithm in Rust
+///
+/// AST (with some explicit type annotations?) -> AST with every node typed!
+///
+/// References:
+/// - https://bernsteinbear.com/blog/type-inference/
 
-    let mut subtypes = Vec::new();
+fn main() {
+    let a_is_b = Node::new(
+        "=",
+        Kind::Assignation,
+        vec![
+            Node::new("a", Kind::Var, vec![]),
+            Node::new("b", Kind::Var, vec![]),
+        ],
+    );
 
-    // First pass: resolve equality constraints.
-    for constraint in constraints {
-        match constraint {
-            Constraint::Equals(a, b) => {
-                unify(a, b, &mut env);
-            }
+    let b_is_num = Node::new(
+        "=",
+        Kind::Assignation,
+        vec![
+            Node::new("b", Kind::Var, vec![]),
+            Node::new("42", Kind::Num, vec![]),
+        ],
+    );
 
-            Constraint::Subtype(a, b) => {
-                subtypes.push((a, b));
-            }
-        }
-    }
+    println!("first call");
+    let mut env = inferno(&a_is_b, TypeEnv::default());
 
-    solve_single_variant_match(&subtypes, &mut env);
+    println!("second call");
+    env = inferno(&b_is_num, env);
+    println!("start checks");
 
-    // Second pass: check subtype constraints.
-    for (a, b) in subtypes {
-        // Apply the substitutions produced by unify().
-        let left = a.borrow().find(&env);
-        let right = b.borrow().find(&env);
-
-        // A <= B iff A \ B is empty.
-        let remainder = normalize(Type::difference(left.clone(), right.clone()));
-
-        if !is_bottom(&remainder) {
-            // that constraint cannot be solved right now. Let store it into
-            // the new env. Furthermore, we can tell that a is b.
-
-            env.constraints.push(Constraint::Subtype(a, b));
-            println!(
-                "could not prove subtype: {:?} <= {:?} (remainder: {:?})",
-                left.borrow(),
-                right.borrow(),
-                remainder.borrow()
-            );
-        }
-    }
-
-    env
+    // check if type has been created
+    assert_eq!(
+        *a_is_b.children[0].find(&mut env).borrow(),
+        Type::Con(TypeCon {
+            name: "u32".into(),
+            args: vec![]
+        })
+    );
 }
 
 /* TESTS */
@@ -1046,50 +1028,32 @@ mod tests {
 
     #[test]
     fn match_unknown_scrutinee() {
-        let ast = Node {
-            lexem: "match",
-            kind: Kind::Match,
-            children: vec![
-                Node {
-                    lexem: "x",
-                    kind: Kind::Var,
-                    children: vec![],
-                    r#type: Default::default(),
-                },
+        let ast = Node::new(
+            "match",
+            Kind::Match,
+            vec![
+                Node::new("x", Kind::Var, vec![]),
                 // Arm: `A(value) => value
-                Node {
-                    lexem: "=>",
-                    kind: Kind::Arm,
-                    children: vec![
+                Node::new(
+                    "=>",
+                    Kind::Arm,
+                    vec![
                         // Pattern: `A(value)
-                        Node {
-                            lexem: "A",
-                            kind: Kind::PatternTag,
-                            children: vec![Node {
-                                lexem: "value",
-                                kind: Kind::PatternBind,
-                                children: vec![],
-                                r#type: Default::default(),
-                            }],
-                            r#type: Default::default(),
-                        },
+                        Node::new(
+                            "A",
+                            Kind::PatternTag,
+                            vec![Node::new("value", Kind::PatternBind, vec![])],
+                        ),
                         // Body: value
-                        Node {
-                            lexem: "value",
-                            kind: Kind::Var,
-                            children: vec![],
-                            r#type: Default::default(),
-                        },
+                        Node::new("value", Kind::Var, vec![]),
                     ],
-                    r#type: Default::default(),
-                },
+                ),
             ],
-            r#type: Default::default(),
-        };
+        );
 
         let mut env = inferno(&ast, TypeEnv::default());
 
-        let inferred = normalize(ast.find(&mut env));
+        let inferred = ast.find(&mut env).normalize();
 
         let ty_x = &ast.children[0].find(&mut env);
         println!("\n\ntype of x: {ty_x:#?}\n\n");
@@ -1099,56 +1063,33 @@ mod tests {
 
     #[test]
     fn match_variant_extracts_payload() {
-        let ast = Node {
-            lexem: "match",
-            kind: Kind::Match,
-            children: vec![
+        let ast = Node::new(
+            "match",
+            Kind::Match,
+            vec![
                 // Scrutinee: `A(42)
-                Node {
-                    lexem: "A",
-                    kind: Kind::Variant,
-                    children: vec![Node {
-                        lexem: "42",
-                        kind: Kind::Num,
-                        children: vec![],
-                        r#type: Default::default(),
-                    }],
-                    r#type: Default::default(),
-                },
+                Node::new("A", Kind::Variant, vec![Node::new("42", Kind::Num, vec![])]),
                 // Arm: `A(value) => value
-                Node {
-                    lexem: "=>",
-                    kind: Kind::Arm,
-                    children: vec![
+                Node::new(
+                    "=>",
+                    Kind::Arm,
+                    vec![
                         // Pattern: `A(value)
-                        Node {
-                            lexem: "A",
-                            kind: Kind::PatternTag,
-                            children: vec![Node {
-                                lexem: "value",
-                                kind: Kind::PatternBind,
-                                children: vec![],
-                                r#type: Default::default(),
-                            }],
-                            r#type: Default::default(),
-                        },
+                        Node::new(
+                            "A",
+                            Kind::PatternTag,
+                            vec![Node::new("value", Kind::PatternBind, vec![])],
+                        ),
                         // Body: value
-                        Node {
-                            lexem: "value",
-                            kind: Kind::Var,
-                            children: vec![],
-                            r#type: Default::default(),
-                        },
+                        Node::new("value", Kind::Var, vec![]),
                     ],
-                    r#type: Default::default(),
-                },
+                ),
             ],
-            r#type: Default::default(),
-        };
+        );
 
         let mut env = inferno(&ast, TypeEnv::default());
 
-        let inferred = normalize(ast.find(&mut env));
+        let inferred = ast.find(&mut env).normalize();
 
         assert_eq!(*inferred.borrow(), *Type::con("u32").borrow());
     }
@@ -1164,7 +1105,7 @@ mod tests {
         // Remove every possible `A value.
         let excluded = Type::variant("A", Type::top());
 
-        let result = normalize(Type::difference(input, excluded));
+        let result = Type::difference(input, excluded).normalize();
 
         // Only `B(bool) should remain.
         assert_eq!(*result.borrow(), *b.borrow());
@@ -1183,18 +1124,14 @@ mod tests {
         let pb = Type::variant("B", Type::top());
 
         // First branch: (t0 \ Bottom) ∩ pa
-        let first = normalize(Type::intersection(
-            Type::difference(t0.clone(), Type::bottom()),
-            pa.clone(),
-        ));
+        let first = Type::intersection(Type::difference(t0.clone(), Type::bottom()), pa.clone())
+            .normalize();
 
         assert_eq!(*first.borrow(), *a.borrow());
 
         // Second branch: (t0 \ pa) ∩ pb
-        let second = normalize(Type::intersection(
-            Type::difference(t0.clone(), pa.clone()),
-            pb.clone(),
-        ));
+        let second =
+            Type::intersection(Type::difference(t0.clone(), pa.clone()), pb.clone()).normalize();
 
         assert_eq!(*second.borrow(), *b.borrow());
 
@@ -1202,9 +1139,9 @@ mod tests {
         // Both previous patterns have already covered t0.
         let covered = Type::union(pa, pb);
 
-        let third = normalize(Type::difference(t0, covered));
+        let third = Type::difference(t0, covered).normalize();
 
-        assert!(is_bottom(&third));
+        assert!(third.is_bottom());
     }
 
     #[test]
@@ -1214,7 +1151,7 @@ mod tests {
 
         let excluded = Type::variant("A", Type::con("u32"));
 
-        let result = normalize(Type::difference(source, excluded));
+        let result = Type::difference(source, excluded).normalize();
 
         // Expected: `A(¬u32)
         let expected = Type::variant("A", Type::negation(Type::con("u32")));
@@ -1224,12 +1161,7 @@ mod tests {
 
     #[test]
     fn a_is_a_variable() {
-        let input = Node {
-            lexem: "a",
-            children: vec![],
-            r#type: Default::default(),
-            kind: Kind::Var,
-        };
+        let input = Node::new("a", Kind::Var, vec![]);
 
         let mut env = inferno(&input, TypeEnv::default());
 
@@ -1242,16 +1174,6 @@ mod tests {
 
     #[test]
     fn paper_example_2_inferno() {
-        // Small AST constructor to keep the test readable.
-        fn n<'a>(lexem: &'a str, kind: Kind, children: Vec<Node<'a>>) -> Node<'a> {
-            Node {
-                lexem,
-                kind,
-                children,
-                r#type: Default::default(),
-            }
-        }
-
         // ------------------------------------------------------
         // Initial types:
         //
@@ -1271,10 +1193,7 @@ mod tests {
 
         env.insert("x".into(), ab.clone());
 
-        env.insert(
-            "id2".into(),
-            Type::con_with_args("->", vec![ab.clone(), ab.clone()]),
-        );
+        env.insert("id2".into(), Type::function(ab.clone(), ab.clone()));
 
         // ------------------------------------------------------
         // AST:
@@ -1285,34 +1204,40 @@ mod tests {
         // }
         // ------------------------------------------------------
 
-        let ast = n(
+        let ast = Node::new(
             "match",
             Kind::Match,
             vec![
                 // Scrutinee: id2(x)
-                n(
+                Node::new(
                     "id2(x)",
                     Kind::Apply,
-                    vec![n("id2", Kind::Var, vec![]), n("x", Kind::Var, vec![])],
+                    vec![
+                        Node::new("id2", Kind::Var, vec![]),
+                        Node::new("x", Kind::Var, vec![]),
+                    ],
                 ),
                 // First arm: A(_) => B(42)
-                n(
+                Node::new(
                     "=>",
                     Kind::Arm,
                     vec![
-                        n(
+                        Node::new(
                             "A",
                             Kind::PatternTag,
-                            vec![n("_", Kind::PatternWildcard, vec![])],
+                            vec![Node::new("_", Kind::PatternWildcard, vec![])],
                         ),
-                        n("B", Kind::Variant, vec![n("42", Kind::Num, vec![])]),
+                        Node::new("B", Kind::Variant, vec![Node::new("42", Kind::Num, vec![])]),
                     ],
                 ),
                 // Second arm: y => y
-                n(
+                Node::new(
                     "=>",
                     Kind::Arm,
-                    vec![n("y", Kind::PatternBind, vec![]), n("y", Kind::Var, vec![])],
+                    vec![
+                        Node::new("y", Kind::PatternBind, vec![]),
+                        Node::new("y", Kind::Var, vec![]),
+                    ],
                 ),
             ],
         );
@@ -1323,7 +1248,7 @@ mod tests {
 
         let mut env = inferno(&ast, env);
 
-        let inferred = normalize(ast.find(&mut env));
+        let inferred = ast.find(&mut env).normalize();
 
         // The entire expression must return only B(u32),
         // rather than A(u32) | B(u32).
@@ -1342,13 +1267,13 @@ mod tests {
         let accepted = Type::variant("A", Type::top());
 
         // Type available to the second branch.
-        let remaining = normalize(Type::difference(scrutinee, accepted));
+        let remaining = Type::difference(scrutinee, accepted).normalize();
 
         assert_eq!(*remaining.borrow(), *b.borrow());
 
         // A -> B returns B.
         // y -> y also returns B.
-        let result = normalize(Type::union(b.clone(), remaining));
+        let result = Type::union(b.clone(), remaining).normalize();
 
         assert_eq!(*result.borrow(), *b.borrow());
     }
@@ -1394,47 +1319,25 @@ mod tests {
     #[test]
     fn apply() {
         println!("function declaration");
-        let id = Node {
-            lexem: "id",
-            children: vec![
-                Node {
-                    lexem: "a",
-                    children: vec![],
-                    r#type: Default::default(),
-                    kind: Kind::Var,
-                },
-                Node {
-                    lexem: "a",
-                    children: vec![],
-                    r#type: Default::default(),
-                    kind: Kind::Var,
-                },
+        let id = Node::new(
+            "id",
+            Kind::Function,
+            vec![
+                Node::new("a", Kind::Var, vec![]),
+                Node::new("a", Kind::Var, vec![]),
             ],
-            r#type: Default::default(),
-            kind: Kind::Function,
-        };
+        );
         let env = inferno(&id, TypeEnv::default());
         println!("{env:?}\n\napply call");
 
-        let apply_id = Node {
-            lexem: "id()",
-            children: vec![
-                Node {
-                    lexem: "id",
-                    children: vec![],
-                    r#type: Default::default(),
-                    kind: Kind::Var,
-                },
-                Node {
-                    lexem: "42",
-                    children: vec![],
-                    r#type: Default::default(),
-                    kind: Kind::Num,
-                },
+        let apply_id = Node::new(
+            "id()",
+            Kind::Apply,
+            vec![
+                Node::new("id", Kind::Var, vec![]),
+                Node::new("42", Kind::Num, vec![]),
             ],
-            r#type: Default::default(),
-            kind: Kind::Apply,
-        };
+        );
 
         let mut env = inferno(&apply_id, env);
 
@@ -1477,12 +1380,12 @@ mod tests {
         assert!(id.children[0].r#type.borrow().is_some());
         assert!(id.children[1].r#type.borrow().is_some());
         let ty = id.find(&mut env);
-        let ty = generalize(&ty);
+        let ty = ty.generalize();
         assert_eq!(
             ty,
             Type::Scheme(Scheme {
                 for_all: vec![Type::var("a"), Type::var("a")],
-                ty: Type::con_with_args("->", vec![Type::var("a"), Type::var("a")]),
+                ty: Type::function(Type::var("a"), Type::var("a")),
             })
         );
     }
@@ -1490,25 +1393,14 @@ mod tests {
 
     #[test]
     fn identity() {
-        let id = Node {
-            lexem: "id",
-            children: vec![
-                Node {
-                    lexem: "a",
-                    children: vec![],
-                    r#type: Default::default(),
-                    kind: Kind::Var,
-                },
-                Node {
-                    lexem: "a",
-                    children: vec![],
-                    r#type: Default::default(),
-                    kind: Kind::Var,
-                },
+        let id = Node::new(
+            "id",
+            Kind::Function,
+            vec![
+                Node::new("a", Kind::Var, vec![]),
+                Node::new("a", Kind::Var, vec![]),
             ],
-            r#type: Default::default(),
-            kind: Kind::Function,
-        };
+        );
 
         println!("start inference");
         let _ = inferno(&id, TypeEnv::default());
@@ -1524,25 +1416,14 @@ mod tests {
 
     #[test]
     fn a_is_b() {
-        let a_is_b = Node {
-            lexem: "=",
-            children: vec![
-                Node {
-                    lexem: "a",
-                    children: vec![],
-                    r#type: Default::default(),
-                    kind: Kind::Var,
-                },
-                Node {
-                    lexem: "b",
-                    children: vec![],
-                    r#type: Default::default(),
-                    kind: Kind::Var,
-                },
+        let a_is_b = Node::new(
+            "=",
+            Kind::Assignation,
+            vec![
+                Node::new("a", Kind::Var, vec![]),
+                Node::new("b", Kind::Var, vec![]),
             ],
-            r#type: Default::default(),
-            kind: Kind::Assignation,
-        };
+        );
 
         let _ = inferno(&a_is_b, TypeEnv::default());
         // check if types have been created
@@ -1552,7 +1433,7 @@ mod tests {
 
     #[test]
     fn test_generalize() {
-        let ty_a = generalize(&Type::var("a"));
+        let ty_a = Type::var("a").generalize();
         assert_eq!(
             ty_a,
             Type::Scheme(Scheme {
@@ -1561,7 +1442,7 @@ mod tests {
             })
         );
 
-        let ty_b = generalize(&Type::con_with_args("b", vec![Type::var("a")]));
+        let ty_b = Type::con_with_args("b", vec![Type::var("a")]).generalize();
         assert_eq!(
             ty_b,
             Type::Scheme(Scheme {
@@ -1572,10 +1453,10 @@ mod tests {
     }
 
     #[test]
-    fn test_instanciate() {
+    fn test_instantiate() {
         let var_a = Type::var("a");
         let ty_a = Type::scheme(vec![var_a.clone()], var_a);
-        let ty_a = instanciate(&ty_a);
+        let ty_a = ty_a.instantiate();
         assert_eq!(
             ty_a,
             Type::Var(TypeVar {
@@ -1586,25 +1467,14 @@ mod tests {
 
     #[test]
     fn a_is_a_num() {
-        let a_is_a_num = Node {
-            lexem: "=",
-            children: vec![
-                Node {
-                    lexem: "a",
-                    children: vec![],
-                    r#type: Default::default(),
-                    kind: Kind::Var,
-                },
-                Node {
-                    lexem: "42",
-                    children: vec![],
-                    r#type: Default::default(),
-                    kind: Kind::Num,
-                },
+        let a_is_a_num = Node::new(
+            "=",
+            Kind::Assignation,
+            vec![
+                Node::new("a", Kind::Var, vec![]),
+                Node::new("42", Kind::Num, vec![]),
             ],
-            r#type: Default::default(),
-            kind: Kind::Assignation,
-        };
+        );
 
         let mut env = inferno(&a_is_a_num, TypeEnv::default());
         // check if type has been created
@@ -1620,45 +1490,23 @@ mod tests {
 
     #[test]
     fn simple_variable_assignation() {
-        let a_is_b = Node {
-            lexem: "=",
-            children: vec![
-                Node {
-                    lexem: "a",
-                    children: vec![],
-                    r#type: Default::default(),
-                    kind: Kind::Var,
-                },
-                Node {
-                    lexem: "b",
-                    children: vec![],
-                    r#type: Default::default(),
-                    kind: Kind::Var,
-                },
+        let a_is_b = Node::new(
+            "=",
+            Kind::Assignation,
+            vec![
+                Node::new("a", Kind::Var, vec![]),
+                Node::new("b", Kind::Var, vec![]),
             ],
-            r#type: Default::default(),
-            kind: Kind::Assignation,
-        };
+        );
 
-        let b_is_num = Node {
-            lexem: "=",
-            children: vec![
-                Node {
-                    lexem: "b",
-                    children: vec![],
-                    r#type: Default::default(),
-                    kind: Kind::Var,
-                },
-                Node {
-                    lexem: "42",
-                    children: vec![],
-                    r#type: Default::default(),
-                    kind: Kind::Num,
-                },
+        let b_is_num = Node::new(
+            "=",
+            Kind::Assignation,
+            vec![
+                Node::new("b", Kind::Var, vec![]),
+                Node::new("42", Kind::Num, vec![]),
             ],
-            r#type: Default::default(),
-            kind: Kind::Assignation,
-        };
+        );
 
         println!("first call");
         let mut env = inferno(&a_is_b, TypeEnv::default());
