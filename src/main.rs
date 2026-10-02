@@ -617,6 +617,10 @@ fn unify(left: TypePtr, right: TypePtr, env: &mut TypeEnv) {
     let left = left.borrow().find(env);
     let right = right.borrow().find(env);
 
+    if same(&left, &right) {
+        return;
+    }
+
     let lty = left.borrow().clone();
     let rty = right.borrow().clone();
 
@@ -1234,6 +1238,119 @@ mod tests {
             *input.get_type(&mut env).borrow(),
             Type::Var(TypeVar { name: "a".into() })
         );
+    }
+
+    #[test]
+    fn paper_example_2_inferno() {
+        // Small AST constructor to keep the test readable.
+        fn n<'a>(lexem: &'a str, kind: Kind, children: Vec<Node<'a>>) -> Node<'a> {
+            Node {
+                lexem,
+                kind,
+                children,
+                r#type: Default::default(),
+            }
+        }
+
+        // ------------------------------------------------------
+        // Initial types:
+        //
+        // A = `A(u32)
+        // B = `B(u32)
+        //
+        // id2 : (A | B) -> (A | B)
+        // x   : A | B
+        // ------------------------------------------------------
+
+        let a = Type::variant("A", Type::con("u32"));
+        let b = Type::variant("B", Type::con("u32"));
+
+        let ab = Type::union(a.clone(), b.clone());
+
+        let mut env = TypeEnv::default();
+
+        env.insert("x".into(), ab.clone());
+
+        env.insert(
+            "id2".into(),
+            Type::con_with_args("->", vec![ab.clone(), ab.clone()]),
+        );
+
+        // ------------------------------------------------------
+        // AST:
+        //
+        // match id2(x) {
+        //     A(_) => B(42),
+        //     y    => y,
+        // }
+        // ------------------------------------------------------
+
+        let ast = n(
+            "match",
+            Kind::Match,
+            vec![
+                // Scrutinee: id2(x)
+                n(
+                    "id2(x)",
+                    Kind::Apply,
+                    vec![n("id2", Kind::Var, vec![]), n("x", Kind::Var, vec![])],
+                ),
+                // First arm: A(_) => B(42)
+                n(
+                    "=>",
+                    Kind::Arm,
+                    vec![
+                        n(
+                            "A",
+                            Kind::PatternTag,
+                            vec![n("_", Kind::PatternWildcard, vec![])],
+                        ),
+                        n("B", Kind::Variant, vec![n("42", Kind::Num, vec![])]),
+                    ],
+                ),
+                // Second arm: y => y
+                n(
+                    "=>",
+                    Kind::Arm,
+                    vec![n("y", Kind::PatternBind, vec![]), n("y", Kind::Var, vec![])],
+                ),
+            ],
+        );
+
+        // ------------------------------------------------------
+        // Run inference. No manual branch refinement!
+        // ------------------------------------------------------
+
+        let mut env = inferno(&ast, env);
+
+        let inferred = normalize(ast.find(&mut env));
+
+        // The entire expression must return only B(u32),
+        // rather than A(u32) | B(u32).
+        assert_eq!(*inferred.borrow(), *b.borrow(),);
+    }
+
+    #[test]
+    fn paper_example_2_semantic_core() {
+        let a = Type::variant("A", Type::con("()"));
+        let b = Type::variant("B", Type::con("()"));
+
+        // Assume the type of id2 x is A | B.
+        let scrutinee = Type::union(a, b.clone());
+
+        // First pattern accepts A(anything).
+        let accepted = Type::variant("A", Type::top());
+
+        // Type available to the second branch.
+        let remaining = normalize(Type::difference(scrutinee, accepted));
+
+        assert_eq!(*remaining.borrow(), *b.borrow());
+
+        // A -> B returns B.
+        // y -> y also returns B.
+        let result = normalize(Type::union(b.clone(), remaining));
+
+        assert_eq!(*result.borrow(), *b.borrow());
     }
 
     #[test]
