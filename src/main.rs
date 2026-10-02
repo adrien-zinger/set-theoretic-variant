@@ -346,7 +346,7 @@ enum Kind {
 #[derive(Clone, Debug)]
 enum Constraint {
     Equals(TypePtr, TypePtr),
-    SubType(TypePtr, TypePtr), // todo
+    Subtype(TypePtr, TypePtr), // todo
 }
 
 #[derive(Debug, Clone)]
@@ -424,6 +424,21 @@ fn variant_or_bottom(tag: &str, payload: TypePtr) -> TypePtr {
         Type::bottom()
     } else {
         Type::variant(tag, payload)
+    }
+}
+
+///  Helper to check if a type is an open variant (a variant with an inner type
+///  that can be anything. It occurs when:
+///  fn unwrap(x) {
+///      match x {
+///          'A(v) => v     // here, the type of x ɑ is a subtype of 'A(Top)
+///      }
+///  }
+fn is_open_variant(ty: &TypePtr, tag: &str) -> bool {
+    match ty.borrow().clone() {
+        Type::Variant(name, payload) => name == tag && is_top(&payload),
+
+        _ => false,
     }
 }
 
@@ -537,6 +552,11 @@ fn subtract(a: TypePtr, b: TypePtr) -> TypePtr {
     // A \ (B ∪ C)
     if let Type::Union(l, r) = b.borrow().clone() {
         return subtract(subtract(a, l), r);
+    }
+
+    // (A ∩ B) \ C = (A \ C) ∩ B
+    if let Type::Intersection(l, r) = a.borrow().clone() {
+        return meet(subtract(l, b.clone()), r);
     }
 
     // Variant-specific difference.
@@ -658,6 +678,7 @@ fn unify(left: TypePtr, right: TypePtr, env: &mut TypeEnv) {
 /// In the latest situation, we know that v must match with the type of the
 /// variant's arm selected. For instance A(u32). v is so binded with u32.
 ///
+/// That function generates symbolic subtype constraints only.
 fn bind_pattern(pattern: &Node, selected: TypePtr, env: &mut TypeEnv) {
     match pattern.kind {
         Kind::PatternWildcard => {}
@@ -684,7 +705,28 @@ fn bind_pattern(pattern: &Node, selected: TypePtr, env: &mut TypeEnv) {
                 // Other cases require a more complete projection
                 // or the tallying algorithm.
                 other => {
-                    panic!("unsupported variant projection: {:?}", other);
+                    // So in "match x" we have x a number, a type variable
+                    // with no substitution, or anything that is added after
+                    // that comment.
+
+                    // That case is agnostic about the type of x. Actually, anything
+                    // it is, we have here to create a constraints: type of x is a
+                    // subtype of the pattern were looking in.
+
+                    // For instance, the pattern "A(value) => value", accept all
+                    // variant A(T). The type of x (let's write X) must respect that:
+                    // x <= A(T).
+
+                    // But we don't find that directly. Instead, we creates the
+                    // constraint that the selected type is a subtype of something
+                    // we'll get later
+                    let fresh = env.fresh();
+                    env.constraints.push(Constraint::Subtype(
+                        selected,
+                        Type::variant(pattern.lexem, fresh.clone()),
+                    ));
+
+                    bind_pattern(&pattern.children[0], fresh, env);
                 }
             }
         }
@@ -822,6 +864,8 @@ fn inferno<'a>(ast: &'a Node<'a>, env: TypeEnv) -> TypeEnv {
                         accepted.clone(),
                     ));
 
+                    println!("selected: \n\n{selected:#?}\n\n");
+
                     // Save the outer expression bindings.
                     // Substitutions and constraints must survive the branch.
                     // todo just clone?
@@ -834,6 +878,7 @@ fn inferno<'a>(ast: &'a Node<'a>, env: TypeEnv) -> TypeEnv {
                     env = inferno_rec(body, env);
 
                     let branch_ty = body.get_type(&mut env);
+                    println!("branch type: \n\n{branch_ty:#?}\n\n");
 
                     // The result is the union of branch results.
                     result = Type::union(result, branch_ty);
@@ -845,9 +890,12 @@ fn inferno<'a>(ast: &'a Node<'a>, env: TypeEnv) -> TypeEnv {
                     covered = Type::union(covered, accepted);
                 }
 
+                println!("result: \n\n{result:#?}\n\n");
+                println!("covered: \n\n{covered:#?}\n\n");
+
                 // Exhaustiveness: t0 <= union of accepted patterns.
                 env.constraints
-                    .push(Constraint::SubType(scrutinee_ty, covered));
+                    .push(Constraint::Subtype(scrutinee_ty, covered));
 
                 ast.r#type.borrow_mut().replace(result);
             }
@@ -856,9 +904,90 @@ fn inferno<'a>(ast: &'a Node<'a>, env: TypeEnv) -> TypeEnv {
         env
     }
 
+    // TODO, I need inferno to not solve anything actually.
+    // (or maybe just the equality constraints).
     solve(inferno_rec(&ast, env))
 }
 
+fn solve_single_variant_match(constraints: &[(TypePtr, TypePtr)], env: &mut TypeEnv) {
+    for (left, right) in constraints {
+        let left = normalize(left.borrow().find(env));
+        let right = normalize(right.borrow().find(env));
+
+        // Look for a right-hand side of the form:
+        //
+        // `A(beta)
+        //
+        let Type::Variant(tag, payload) = right.borrow().clone() else {
+            continue;
+        };
+
+        // This restricted case expects a symbolic payload.
+        if !matches!(&*payload.borrow(), Type::Var(_)) {
+            continue;
+        }
+
+        // Look for:
+        //
+        // (alpha ∩ `A(Top)) <= `A(beta)
+        //
+        let Type::Intersection(a, b) = left.borrow().clone() else {
+            continue;
+        };
+
+        let alpha = match (a.borrow().clone(), b.borrow().clone()) {
+            (Type::Var(var), _) if is_open_variant(&b, &tag) => var,
+
+            (_, Type::Var(var)) if is_open_variant(&a, &tag) => var,
+
+            _ => continue,
+        };
+
+        // We also need the exhaustiveness constraint:
+        //
+        // alpha <= `A(Top)
+        //
+        // Without it, we cannot globally restrict alpha
+        // to the A variant: there might be other branches.
+        let exhaustive = constraints.iter().any(|(lo, hi)| {
+            let lo = normalize(lo.borrow().find(env));
+            let hi = normalize(hi.borrow().find(env));
+
+            let is_alpha = match lo.borrow().clone() {
+                Type::Var(v) => v.name == alpha.name,
+                _ => false,
+            };
+
+            is_alpha && is_open_variant(&hi, &tag)
+        });
+
+        if !exhaustive {
+            continue;
+        }
+
+        // Instead of choosing:
+        //
+        // alpha := `A(beta)
+        //
+        // introduce another fresh variable gamma:
+        //
+        // alpha := `A(beta) ∩ gamma
+        //
+        let gamma = env.fresh();
+        let candidate = Type::intersection(Type::variant(&tag, payload), gamma);
+
+        println!("\n\ncandidate type:\n{candidate:#?}\n\n");
+
+        // todo
+        // if occurs_in(&alpha.name, &candidate, env) {
+        //     panic!("recursive subtype solution");
+        // }
+
+        env.substitute(&alpha, candidate);
+    }
+}
+
+// Solve all the constraints, Equals and Subtypes.
 fn solve(mut env: TypeEnv) -> TypeEnv {
     let constraints = std::mem::take(&mut env.constraints);
 
@@ -871,11 +1000,13 @@ fn solve(mut env: TypeEnv) -> TypeEnv {
                 unify(a, b, &mut env);
             }
 
-            Constraint::SubType(a, b) => {
+            Constraint::Subtype(a, b) => {
                 subtypes.push((a, b));
             }
         }
     }
+
+    solve_single_variant_match(&subtypes, &mut env);
 
     // Second pass: check subtype constraints.
     for (a, b) in subtypes {
@@ -887,7 +1018,11 @@ fn solve(mut env: TypeEnv) -> TypeEnv {
         let remainder = normalize(Type::difference(left.clone(), right.clone()));
 
         if !is_bottom(&remainder) {
-            panic!(
+            // that constraint cannot be solved right now. Let store it into
+            // the new env. Furthermore, we can tell that a is b.
+
+            env.constraints.push(Constraint::Subtype(a, b));
+            println!(
                 "could not prove subtype: {:?} <= {:?} (remainder: {:?})",
                 left.borrow(),
                 right.borrow(),
@@ -904,6 +1039,59 @@ fn solve(mut env: TypeEnv) -> TypeEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn match_unknown_scrutinee() {
+        let ast = Node {
+            lexem: "match",
+            kind: Kind::Match,
+            children: vec![
+                Node {
+                    lexem: "x",
+                    kind: Kind::Var,
+                    children: vec![],
+                    r#type: Default::default(),
+                },
+                // Arm: `A(value) => value
+                Node {
+                    lexem: "=>",
+                    kind: Kind::Arm,
+                    children: vec![
+                        // Pattern: `A(value)
+                        Node {
+                            lexem: "A",
+                            kind: Kind::PatternTag,
+                            children: vec![Node {
+                                lexem: "value",
+                                kind: Kind::PatternBind,
+                                children: vec![],
+                                r#type: Default::default(),
+                            }],
+                            r#type: Default::default(),
+                        },
+                        // Body: value
+                        Node {
+                            lexem: "value",
+                            kind: Kind::Var,
+                            children: vec![],
+                            r#type: Default::default(),
+                        },
+                    ],
+                    r#type: Default::default(),
+                },
+            ],
+            r#type: Default::default(),
+        };
+
+        let mut env = inferno(&ast, TypeEnv::default());
+
+        let inferred = normalize(ast.find(&mut env));
+
+        let ty_x = &ast.children[0].find(&mut env);
+        println!("\n\ntype of x: {ty_x:#?}\n\n");
+
+        assert!(matches!(&*inferred.borrow(), Type::Var(_)));
+    }
 
     #[test]
     fn match_variant_extracts_payload() {
